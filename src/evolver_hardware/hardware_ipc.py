@@ -76,10 +76,20 @@ class HardwareIPCServer:
 
     def start(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            self.path.unlink()
-        except FileNotFoundError:
-            pass
+        if self.path.exists():
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe.settimeout(0.2)
+                probe.connect(str(self.path))
+            except OSError:
+                # A dead daemon may leave a socket inode behind; only that
+                # stale endpoint may be removed. A live owner is never
+                # displaced by a second hardware authority.
+                self.path.unlink(missing_ok=True)
+            else:
+                raise RuntimeError(f"hardware IPC socket already owned: {self.path}")
+            finally:
+                probe.close()
         self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._server.bind(str(self.path))
         os.chmod(self.path, 0o660)
