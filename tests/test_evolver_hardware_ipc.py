@@ -58,7 +58,7 @@ def test_ipc_is_typed_and_read_only_calls_use_the_daemon(tmp_path):
         try:
             found = request(path, {"operation": "discover"})
             assert found["device_identity"] == "MEV-1"
-            assert stat.S_IMODE(path.stat().st_mode) == 0o660
+            assert stat.S_IMODE(path.stat().st_mode) == 0o600
             assert request(path, {"operation": "protocol_test"})["verification"] == "protocol_verified"
             with pytest.raises(RuntimeError, match="unsupported typed"):
                 request(path, {"operation": "raw_frame", "raw_frame": "PULSE"})

@@ -92,7 +92,10 @@ class HardwareIPCServer:
                 probe.close()
         self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._server.bind(str(self.path))
-        os.chmod(self.path, 0o660)
+        # The controller runs as the owner of the shared runtime volume.  Do
+        # not grant the Edge Dev Container (which joins group 0 for Docker
+        # access) direct access to actuator-capable hardware IPC.
+        os.chmod(self.path, 0o600)
         self._server.listen(8)
         threading.Thread(target=self._serve, name="evolver-hardware-ipc", daemon=True).start()
 
