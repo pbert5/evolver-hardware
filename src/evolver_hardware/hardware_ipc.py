@@ -150,7 +150,10 @@ class HardwareIPCServer:
             if not isinstance(target, str): raise ValueError("target_identity is required")
             return self.service.command(operation, target, request.get("parameters") or {}).as_json()
         if operation == "lease_acquire":
-            return self.store.acquire_local_commissioning_lease(str(request.get("operator", "")), int(request.get("ttl_seconds", 900)))
+            generation = request.get("controller_generation")
+            return self.store.acquire_local_commissioning_lease(
+                str(request.get("operator", "")), int(request.get("ttl_seconds", 900)),
+                controller_generation=int(generation) if generation is not None else None)
         if operation == "lease_status":
             return self.store.local_commissioning_lease_status()
         if operation == "lease_release":
