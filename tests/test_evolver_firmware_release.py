@@ -325,7 +325,6 @@ def test_release_self_contained_checker_requires_firmware(tmp_path: Path) -> Non
     assert "firmware artifact" in result.stderr
 
 
-@pytest.mark.xfail(strict=True, reason="release assembly and validation are owned by the root release repository, not evolver-hardware")
 def test_release_builder_records_firmware_size_and_manifest_timestamp(tmp_path: Path) -> None:
     x86, arm, firmware = (tmp_path / name for name in ("x86.tar.gz", "arm.tar.gz", "firmware.bin"))
     x86.write_bytes(b"x86")
@@ -452,7 +451,6 @@ def _toolchain_artifact(path: Path, *, bossac_version: str = "1.7.0-arduino3") -
             archive.addfile(info, __import__("io").BytesIO(data))
 
 
-@pytest.mark.xfail(strict=True, reason="release manifest assembly is owned by the root release repository, not evolver-hardware")
 def test_release_manifest_embeds_offline_toolchain_contract(tmp_path: Path) -> None:
     artifact, firmware = tmp_path / "x86.tar.gz", tmp_path / "firmware.bin"
     _toolchain_artifact(artifact); firmware.write_bytes(b"firmware")
