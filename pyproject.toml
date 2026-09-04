@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "evolver-hardware"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = ["pyserial==3.5"]
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-xdist>=3.8"]
+[project.scripts]
+evolver-hardware = "evolver_hardware.hardware_service:main"
+[tool.setuptools.packages.find]
+where = ["src"]
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
