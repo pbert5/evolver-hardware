@@ -1,4 +1,4 @@
-"""Systemd-oriented owner for safe physical min-eVOLVER observation."""
+"""Compose-service owner for safe physical min-eVOLVER observation."""
 from __future__ import annotations
 
 import argparse
