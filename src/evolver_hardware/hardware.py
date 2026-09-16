@@ -19,6 +19,7 @@ import fcntl
 import errno
 import glob
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Protocol
@@ -28,6 +29,9 @@ from uuid import uuid4
 from uuid import NAMESPACE_URL, uuid5
 
 from .store import EdgeStore, EdgeStoreError, Json, LeaseValidationError
+
+
+_SESSION_MUTEX = threading.Lock()
 
 
 HANDSHAKE = "WHO_ARE_YOU_!"
@@ -423,21 +427,22 @@ class ReadOnlyHardwareService:
 
     @contextmanager
     def _session(self) -> Iterator[None]:
-        self._lock_path.touch(mode=0o600, exist_ok=True)
-        with self._lock_path.open("r+") as lock:
-            try:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as error:
-                raise ProbeError(ProbeOutcome.BUSY, "another eVOLVER hardware service owns serial",
-                                 evidence={"operation": "lock"}, cause=error)
-            try:
-                self.transport.open()
-                yield
-            finally:
+        with _SESSION_MUTEX:
+            self._lock_path.touch(mode=0o600, exist_ok=True)
+            with self._lock_path.open("r+") as lock:
                 try:
-                    self.transport.close()
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as error:
+                    raise ProbeError(ProbeOutcome.BUSY, "another eVOLVER hardware service owns serial",
+                                     evidence={"operation": "lock"}, cause=error)
+                try:
+                    self.transport.open()
+                    yield
                 finally:
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                    try:
+                        self.transport.close()
+                    finally:
+                        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
     def _identity_with_startup_retry(self) -> DeviceIdentity:
         """Read identity with a bounded, immediate retry for USB reset startup.

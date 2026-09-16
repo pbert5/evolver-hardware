@@ -114,6 +114,25 @@ class FakeTransport:
         raise AssertionError(f"unsafe or unknown command: {payload}")
 
 
+def test_session_releases_mutex_and_flock_after_transport_exception(tmp_path) -> None:
+    class FailingTransport(FakeTransport):
+        def __init__(self):
+            super().__init__(); self.fail = True
+
+        def exchange(self, payload):
+            if self.fail:
+                self.fail = False
+                raise RuntimeError("probe failed")
+            return super().exchange(payload)
+
+    with EdgeStore(tmp_path) as store:
+        transport = FailingTransport()
+        service = ReadOnlyHardwareService(store, transport, startup_attempts=1)
+        with pytest.raises(RuntimeError, match="probe failed"):
+            service.discover()
+        assert service.discover()["device_identity"] == "MEV-001"
+
+
 def test_read_only_service_registers_provisioned_inventory_and_spools_raw_sensor_data(tmp_path) -> None:
     with EdgeStore(tmp_path) as store:
         transport = FakeTransport()
