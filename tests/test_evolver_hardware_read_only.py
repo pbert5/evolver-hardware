@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -112,6 +113,32 @@ class FakeTransport:
         if payload.startswith("HW_READ_PHOTODIODE,"):
             return f"HW|1|OK|PHOTODIODE|channel={payload.split(',')[1][0]},value=20000"
         raise AssertionError(f"unsafe or unknown command: {payload}")
+
+
+def test_hardware_service_serializes_sessions_within_one_daemon(tmp_path) -> None:
+    with EdgeStore(tmp_path) as store:
+        service = HardwareService(store, FakeTransport())
+        entered = threading.Event()
+        release = threading.Event()
+        second_entered = threading.Event()
+
+        def first_session() -> None:
+            with service._session():
+                entered.set()
+                release.wait(timeout=2)
+
+        def second_session() -> None:
+            with service._session():
+                second_entered.set()
+
+        first = threading.Thread(target=first_session)
+        second = threading.Thread(target=second_session)
+        first.start(); assert entered.wait(timeout=2)
+        second.start()
+        assert not second_entered.wait(timeout=0.1)
+        release.set()
+        first.join(timeout=2); second.join(timeout=2)
+        assert second_entered.is_set()
 
 
 def test_read_only_service_registers_provisioned_inventory_and_spools_raw_sensor_data(tmp_path) -> None:

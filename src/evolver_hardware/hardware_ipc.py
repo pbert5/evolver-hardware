@@ -92,10 +92,16 @@ class HardwareIPCServer:
                 probe.close()
         self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._server.bind(str(self.path))
-        # The controller runs as the owner of the shared runtime volume.  Do
-        # not grant the Edge Dev Container (which joins group 0 for Docker
-        # access) direct access to actuator-capable hardware IPC.
-        os.chmod(self.path, 0o600)
+        # The controller and documented Edge Dev Container are clients of this
+        # socket. Keep access group-scoped; typed protocol gates still protect
+        # physical mutations.
+        os.chmod(self.path, 0o660)
+        socket_gid = os.environ.get("EVOLVER_HARDWARE_SOCKET_GID")
+        if socket_gid is not None:
+            try:
+                os.chown(self.path, -1, int(socket_gid))
+            except (TypeError, ValueError, PermissionError) as error:
+                raise RuntimeError("EVOLVER_HARDWARE_SOCKET_GID must be an accessible numeric group") from error
         self._server.listen(8)
         threading.Thread(target=self._serve, name="evolver-hardware-ipc", daemon=True).start()
 

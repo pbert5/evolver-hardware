@@ -19,6 +19,7 @@ import fcntl
 import errno
 import glob
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Protocol
@@ -420,24 +421,29 @@ class ReadOnlyHardwareService:
         self.store, self.transport = store, transport
         self.startup_attempts = startup_attempts
         self._lock_path = store.root / "hardware-service.lock"
+        # flock remains the cross-process serial fence. Separate open file
+        # descriptions in sibling threads are not reentrant, so serialize
+        # sessions inside the daemon before taking that fence.
+        self._session_lock = threading.Lock()
 
     @contextmanager
     def _session(self) -> Iterator[None]:
-        self._lock_path.touch(mode=0o600, exist_ok=True)
-        with self._lock_path.open("r+") as lock:
-            try:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as error:
-                raise ProbeError(ProbeOutcome.BUSY, "another eVOLVER hardware service owns serial",
-                                 evidence={"operation": "lock"}, cause=error)
-            try:
-                self.transport.open()
-                yield
-            finally:
+        with self._session_lock:
+            self._lock_path.touch(mode=0o600, exist_ok=True)
+            with self._lock_path.open("r+") as lock:
                 try:
-                    self.transport.close()
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as error:
+                    raise ProbeError(ProbeOutcome.BUSY, "another eVOLVER hardware service owns serial",
+                                     evidence={"operation": "lock"}, cause=error)
+                try:
+                    self.transport.open()
+                    yield
                 finally:
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                    try:
+                        self.transport.close()
+                    finally:
+                        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
     def _identity_with_startup_retry(self) -> DeviceIdentity:
         """Read identity with a bounded, immediate retry for USB reset startup.
