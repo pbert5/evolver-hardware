@@ -619,7 +619,7 @@ class HardwareService(ReadOnlyHardwareService):
                  startup_attempts: int = 3) -> None:
         super().__init__(store, transport, startup_attempts=startup_attempts)
         self.allow_physical, self.operator, self.daemon_capable = allow_physical, operator, daemon_capable
-        self._frozen_temperature_setpoints: dict[str, dict[str, Any]] = {}
+        self._frozen_temperature_setpoints: dict[tuple[str, int], dict[str, Any]] = {}
         self.last_temperature_refresh_command_ids: list[str] = []
 
     def _require_target(self, target_identity: str) -> DeviceIdentity:
@@ -727,59 +727,66 @@ class HardwareService(ReadOnlyHardwareService):
                                              operator=context.pop("operator", None), **context))
 
     def _temperature_setpoints(self, instrument_id: str, parameters: Mapping[str, Any]) -> tuple[TemperatureSetpoint, ...]:
-        """Validate and freeze all calibration inputs before opening serial."""
+        """Validate and freeze one canonical per-vial target before serial I/O."""
         target = parameters.get("temperature_c", parameters.get("target_temperature"))
         if isinstance(target, bool) or not isinstance(target, (int, float)) or not math.isfinite(float(target)) or not 0 <= float(target) <= 100:
             raise ValueError("temperature_c must be finite and between 0 and 100")
         instrument = self.store.instrument(instrument_id)
         positions = instrument.get("vial_positions")
-        calibrations = parameters.get("calibrations")
-        if not isinstance(positions, list) or not positions or not isinstance(calibrations, (list, tuple, dict)):
-            raise ValueError("set_temperature requires one calibration for every vial")
-        if len(positions) > TEMPERATURE_CHANNEL_BOUNDS[1] + 1:
-            raise ValueError("temperature calibration contains unsupported channels")
+        vial_id = parameters.get("vial_position_id")
+        channel = parameters.get("channel")
+        supplied_raw = parameters.get("raw_target_adc")
+        calibration = parameters.get("calibration")
+        if not isinstance(positions, list) or not positions:
+            raise ValueError("instrument has no vial positions")
+        if not isinstance(vial_id, str) or not vial_id:
+            raise ValueError("set_temperature requires vial_position_id")
+        if (isinstance(channel, bool) or not isinstance(channel, int) or
+                not TEMPERATURE_CHANNEL_BOUNDS[0] <= channel <= TEMPERATURE_CHANNEL_BOUNDS[1]):
+            raise ValueError("temperature channel is unsupported")
+        if (isinstance(supplied_raw, bool) or not isinstance(supplied_raw, int) or
+                not RAW_TEMPERATURE_TARGET_BOUNDS[0] <= supplied_raw <= RAW_TEMPERATURE_TARGET_BOUNDS[1]):
+            raise ValueError("raw_target_adc is outside the transport domain")
+        if not isinstance(calibration, Mapping):
+            raise ValueError("set_temperature requires one calibration summary")
+        position = next((item for item in positions if str(item.get("id", "")) == vial_id), None)
+        if not isinstance(position, Mapping):
+            raise ValueError("vial_position_id is not registered for the instrument")
+        if position.get("position_index") != channel:
+            raise ValueError("temperature channel does not match vial position")
         hardware_fingerprint = instrument.get("hardware_fingerprint")
         if not isinstance(hardware_fingerprint, Mapping) or not hardware_fingerprint:
             raise ValueError("temperature calibration requires an immutable hardware fingerprint")
-        authoritative = {str(item.get("id")): item for item in
-                         self.store.calibration_artifacts(instrument_id=instrument_id)
-                         if isinstance(item, Mapping) and isinstance(item.get("id"), str)}
-        if isinstance(calibrations, dict):
-            entries = [{"vial_position_id": key, **(value if isinstance(value, Mapping) else {})}
-                       for key, value in calibrations.items()]
-        else:
-            entries = [dict(item) for item in calibrations if isinstance(item, Mapping)]
-        by_vial = {str(item.get("vial_position_id")): item for item in entries}
-        if len(entries) != len(by_vial) or set(by_vial) != {str(position.get("id", "")) for position in positions}:
-            raise ValueError("temperature calibration must exactly cover every vial")
-        result: list[TemperatureSetpoint] = []
-        for channel, position in enumerate(positions):
-            vial_id = str(position.get("id", ""))
-            calibration = by_vial.get(vial_id)
-            if calibration is None:
-                raise ValueError("temperature calibration is missing or duplicated")
-            if calibration.get("calibration_type", "temperature") != "temperature" or calibration.get("status", calibration.get("assessment", {}).get("status")) not in {"valid", "accepted"}:
-                raise ValueError("temperature calibration is not valid")
-            artifact_id, digest = calibration.get("artifact_id", calibration.get("id")), calibration.get("artifact_digest")
-            slope, intercept = calibration.get("slope"), calibration.get("intercept", 0.0)
-            if not all(isinstance(value, str) and value for value in (artifact_id, digest)):
-                raise ValueError("temperature calibration identity is incomplete")
-            artifact = authoritative.get(str(artifact_id))
-            if (not isinstance(artifact, Mapping) or artifact.get("artifact_digest") != digest or
-                    artifact.get("hardware_fingerprint") != dict(hardware_fingerprint) or
-                    calibration.get("hardware_fingerprint") != dict(hardware_fingerprint)):
-                raise ValueError("temperature calibration lacks immutable authority or hardware fingerprint binding")
-            if ("slope" in calibration and calibration.get("slope") != artifact.get("slope")) or (
-                    "intercept" in calibration and calibration.get("intercept") != artifact.get("intercept", 0.0)):
-                raise ValueError("temperature calibration coefficients do not match immutable authority")
-            slope, intercept = artifact.get("slope"), artifact.get("intercept", 0.0)
-            if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) for value in (slope, intercept)) or float(slope) <= 0:
-                raise ValueError("temperature calibration coefficients are invalid")
-            raw = round((float(target) - float(intercept)) / float(slope))
-            if not RAW_TEMPERATURE_TARGET_BOUNDS[0] <= raw <= RAW_TEMPERATURE_TARGET_BOUNDS[1]:
-                raise ValueError("temperature calibration produces an out-of-range firmware PID target")
-            result.append(TemperatureSetpoint(channel, vial_id, float(target), raw, artifact_id, digest))
-        return tuple(result)
+        artifact_id, digest = calibration.get("artifact_id"), calibration.get("artifact_digest")
+        if not all(isinstance(value, str) and value for value in (artifact_id, digest)):
+            raise ValueError("temperature calibration identity is incomplete")
+        if calibration.get("calibration_type") != "temperature" or calibration.get("status", calibration.get("assessment", {}).get("status")) not in {"valid", "accepted"}:
+            raise ValueError("temperature calibration is not valid")
+        artifact = next((item for item in self.store.calibration_artifacts(instrument_id=instrument_id)
+                         if isinstance(item, Mapping) and item.get("id") == artifact_id), None)
+        if (not isinstance(artifact, Mapping) or artifact.get("artifact_digest") != digest or
+                artifact.get("instrument_id") != instrument_id or artifact.get("vial_position_id") != vial_id or
+                artifact.get("calibration_type") != "temperature" or artifact.get("method") != "temperature_linear_v1" or
+                artifact.get("method_version") != "1" or artifact.get("hardware_fingerprint") != dict(hardware_fingerprint) or
+                calibration.get("hardware_fingerprint") != dict(hardware_fingerprint)):
+            raise ValueError("temperature calibration lacks immutable authority or hardware fingerprint binding")
+        coefficients, ranges = artifact.get("coefficients"), artifact.get("calibration_range")
+        if not isinstance(coefficients, Mapping) or not isinstance(ranges, Mapping):
+            raise ValueError("temperature calibration canonical schema is incomplete")
+        slope, intercept = coefficients.get("slope"), coefficients.get("intercept")
+        required_ranges = ("raw_min", "raw_max", "reference_min", "reference_max")
+        if (any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value))
+                for value in (slope, intercept)) or float(slope) <= 0 or
+                any(isinstance(ranges.get(name), bool) or not isinstance(ranges.get(name), (int, float)) or
+                    not math.isfinite(float(ranges.get(name))) for name in required_ranges)):
+            raise ValueError("temperature calibration canonical coefficients or range is invalid")
+        raw = round((float(target) - float(intercept)) / float(slope))
+        if not (float(ranges["raw_min"]) <= raw <= float(ranges["raw_max"]) and
+                float(ranges["reference_min"]) <= float(target) <= float(ranges["reference_max"])):
+            raise ValueError("temperature target is outside immutable calibration range")
+        if raw != supplied_raw:
+            raise ValueError("raw_target_adc does not match immutable calibration")
+        return (TemperatureSetpoint(channel, vial_id, float(target), raw, artifact_id, digest),)
 
     def set_temperature(self, instrument_id: str, parameters: Mapping[str, Any], **context: Any) -> HardwareResult:
         """Apply a calibrated Celsius setpoint and retain only volatile refresh state."""
@@ -818,7 +825,7 @@ class HardwareService(ReadOnlyHardwareService):
                 fields = frame.removesuffix("_!").split("|")
                 _temperature_reply(reply, correlation=int(fields[3]), operation="SET",
                                    channel=int(fields[4]), raw=int(fields[5]))
-            self._frozen_temperature_setpoints[instrument_id] = {
+            self._frozen_temperature_setpoints[(instrument_id, frozen[0].channel)] = {
                 "setpoints": frozen,
                 "target_identity": command.target_identity,
                 "operator": operator,
@@ -846,7 +853,7 @@ class HardwareService(ReadOnlyHardwareService):
     def refresh_temperature_setpoints(self) -> list[HardwareResult]:
         """Refresh volatile PID targets; firmware's 15-second dead-man owns expiry."""
         refreshed: list[HardwareResult] = []
-        for instrument_id, state in tuple(self._frozen_temperature_setpoints.items()):
+        for (_instrument_id, _channel), state in tuple(self._frozen_temperature_setpoints.items()):
             setpoints = state["setpoints"]
             self.store.validate_control_lease(
                 lease_token=state["lease_token"], owner=state["lease_owner"],
@@ -907,7 +914,11 @@ class HardwareService(ReadOnlyHardwareService):
         results: list[HardwareResult] = []
         binding = self.store.binding() or {}
         generation = int(binding.get("generation", 0))
+        stopped_targets: set[str] = set()
         for state in states:
+            if state["target_identity"] in stopped_targets:
+                continue
+            stopped_targets.add(state["target_identity"])
             results.append(self.command("safe_stop", state["target_identity"], {},
                                         command_id=str(uuid4()), operator=state["operator"],
                                         controller_generation=generation))
