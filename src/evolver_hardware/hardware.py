@@ -574,13 +574,18 @@ class HardwareService(ReadOnlyHardwareService):
         # Direct mock/developer service calls retain the historical physical
         # gate when no lease has ever been installed; once a lease exists, or
         # for every daemon IPC request, lease fencing is mandatory.
-        if actuator and (request.require_lease or self.store.meta("control_lease") is not None):
+        if actuator and request.operation != "safe_stop" and (
+                request.require_lease or self.store.meta("control_lease") is not None):
             self.store.validate_control_lease(lease_token=request.lease_token, owner=request.lease_owner or effective_operator,
                                               generation=request.controller_generation)
         if request.timeout <= 0:
             raise ValueError("timeout must be positive")
         def handler() -> dict[str, Any]:
             try:
+                if request.operation == "safe_stop" and not any(
+                        item.get("device_identity") == request.target_identity
+                        for item in self.store.list_instruments()):
+                    raise HardwareUnavailableError("target device identity is not registered")
                 with self._session():
                     identity = _identity_reply(self.transport.exchange(HANDSHAKE))
                     if not identity.provisioned or identity.device_id != request.target_identity:
@@ -597,7 +602,7 @@ class HardwareService(ReadOnlyHardwareService):
                     "component": component, "component_state": "fault", "fault": {"kind": "actuator_protocol", "reason": str(error)},
                     "command_id": request.command_id, "controller_generation": request.controller_generation})
                 return HardwareResult(request.command_id, False, str(error),
-                                      {"component": component, "fault": str(error), "operator": self.operator},
+                                      {"component": component, "fault": str(error), "operator": effective_operator},
                                       "protocol_failed", False).as_json()
         result = self.store.execute_command({"command_id": request.command_id,
                                               "controller_generation": request.controller_generation}, handler)
