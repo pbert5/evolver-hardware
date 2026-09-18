@@ -26,7 +26,7 @@ PROVISIONING_EXCHANGE_COUNT = 3
 PROVISIONING_INNER_BUDGET_SECONDS = PROVISIONING_EXCHANGE_COUNT * HARDWARE_EXCHANGE_TIMEOUT_SECONDS
 PROVISIONING_IPC_TIMEOUT_SECONDS = PROVISIONING_INNER_BUDGET_SECONDS + 1.0
 READ_OPERATIONS = {"discover", "get_status", "read_sensor", "protocol_test"}
-ACTUATOR_OPERATIONS = {"safe_stop", "set_stir", "set_output", "pulse_pump", "pulse_heater"}
+ACTUATOR_OPERATIONS = {"safe_stop", "set_stir", "set_output", "pulse_pump", "pulse_heater", "set_temperature"}
 
 
 def _send(sock: socket.socket, value: dict[str, Any]) -> None:
@@ -76,13 +76,26 @@ class HardwareIPCServer:
 
     def start(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            self.path.unlink()
-        except FileNotFoundError:
-            pass
+        if self.path.exists():
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                probe.settimeout(0.2)
+                probe.connect(str(self.path))
+            except OSError:
+                # A dead daemon may leave a socket inode behind; only that
+                # stale endpoint may be removed. A live owner is never
+                # displaced by a second hardware authority.
+                self.path.unlink(missing_ok=True)
+            else:
+                raise RuntimeError(f"hardware IPC socket already owned: {self.path}")
+            finally:
+                probe.close()
         self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self._server.bind(str(self.path))
-        os.chmod(self.path, 0o660)
+        # The controller runs as the owner of the shared runtime volume.  Do
+        # not grant the Edge Dev Container (which joins group 0 for Docker
+        # access) direct access to actuator-capable hardware IPC.
+        os.chmod(self.path, 0o600)
         self._server.listen(8)
         threading.Thread(target=self._serve, name="evolver-hardware-ipc", daemon=True).start()
 
@@ -137,7 +150,10 @@ class HardwareIPCServer:
             if not isinstance(target, str): raise ValueError("target_identity is required")
             return self.service.command(operation, target, request.get("parameters") or {}).as_json()
         if operation == "lease_acquire":
-            return self.store.acquire_local_commissioning_lease(str(request.get("operator", "")), int(request.get("ttl_seconds", 900)))
+            generation = request.get("controller_generation")
+            return self.store.acquire_local_commissioning_lease(
+                str(request.get("operator", "")), int(request.get("ttl_seconds", 900)),
+                controller_generation=int(generation) if generation is not None else None)
         if operation == "lease_status":
             return self.store.local_commissioning_lease_status()
         if operation == "lease_release":
@@ -159,9 +175,17 @@ class HardwareIPCServer:
             target = request.get("target_identity")
             operator = request.get("operator")
             if not isinstance(target, str) or not isinstance(operator, str) or not operator: raise ValueError("operator and target_identity are required")
+            requires_lease = operation != "safe_stop"
+            if operation == "set_temperature":
+                instrument = next((item for item in self.store.list_instruments() if item.get("device_identity") == target), None)
+                if not instrument:
+                    raise EdgeStoreError("setpoint target identity is not registered")
+                return self.service.set_temperature(instrument["id"], request.get("parameters") or {}, command_id=request.get("command_id", str(uuid4())),
+                                                    operator=operator, lease_token=request.get("lease_token"), lease_owner=operator,
+                                                    require_lease=True, controller_generation=int(request.get("controller_generation", 0))).as_json()
             return self.service.command(operation, target, request.get("parameters") or {}, command_id=request.get("command_id", str(uuid4())),
                                         operator=operator, lease_token=request.get("lease_token"), lease_owner=operator,
-                                        require_lease=True, controller_generation=int(request.get("controller_generation", 0))).as_json()
+                                        require_lease=requires_lease, controller_generation=int(request.get("controller_generation", 0))).as_json()
         raise ValueError("unsupported typed hardware IPC operation")
 
 

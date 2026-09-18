@@ -76,6 +76,15 @@ def test_local_serial_transport_reads_firmware_newline_terminated_reply(monkeypa
     assert transport.exchange("PING_!") == "MEV|2|id|1|HELLO|type=minievolver"
 
 
+def test_local_serial_transport_preserves_v2_temperature_ack(monkeypatch: pytest.MonkeyPatch) -> None:
+    frame = "TEMP|2|SET|17|0|65535|ash|123456|1_!"
+    serial_module(monkeypatch, responses={frame: b"TEMP|2|ACK|17|SET|channel=0,raw=65535,ceiling=64\n"})
+    transport = LocalSerialTransport("/dev/ttyACM-pty-fake")
+    transport.open()
+    assert transport.exchange(frame) == "TEMP|2|ACK|17|SET|channel=0,raw=65535,ceiling=64"
+    assert FakeSerial.instances[0].writes == [frame.encode()]
+
+
 def test_local_serial_transport_discards_stale_input_at_session_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
     serial_module(monkeypatch, responses={"PING_!": b"FRESH\n"}, initial_input=b"STALE\n")
     transport = LocalSerialTransport("/dev/ttyACM-fake")
@@ -112,6 +121,25 @@ class FakeTransport:
         if payload.startswith("HW_READ_PHOTODIODE,"):
             return f"HW|1|OK|PHOTODIODE|channel={payload.split(',')[1][0]},value=20000"
         raise AssertionError(f"unsafe or unknown command: {payload}")
+
+
+def test_session_releases_mutex_and_flock_after_transport_exception(tmp_path) -> None:
+    class FailingTransport(FakeTransport):
+        def __init__(self):
+            super().__init__(); self.fail = True
+
+        def exchange(self, payload):
+            if self.fail:
+                self.fail = False
+                raise RuntimeError("probe failed")
+            return super().exchange(payload)
+
+    with EdgeStore(tmp_path) as store:
+        transport = FailingTransport()
+        service = ReadOnlyHardwareService(store, transport, startup_attempts=1)
+        with pytest.raises(RuntimeError, match="probe failed"):
+            service.discover()
+        assert service.discover()["device_identity"] == "MEV-001"
 
 
 def test_read_only_service_registers_provisioned_inventory_and_spools_raw_sensor_data(tmp_path) -> None:

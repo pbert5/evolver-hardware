@@ -1,4 +1,4 @@
-"""Systemd-oriented owner for safe physical min-eVOLVER observation."""
+"""Compose-service owner for safe physical min-eVOLVER observation."""
 from __future__ import annotations
 
 import argparse
@@ -18,6 +18,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-root", default=os.environ.get("EVOLVER_STATE_ROOT", "/var/lib/evolver-controller"))
     parser.add_argument("--port", help="explicit serial port; required when more than one ACM device is present")
     parser.add_argument("--interval", type=float, default=10.0, help="safe sensor poll interval in seconds")
+    parser.add_argument("--refresh-interval", type=float, default=5.0, help="volatile temperature setpoint refresh interval in seconds")
     return parser
 
 
@@ -25,6 +26,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.interval <= 0:
         raise SystemExit("--interval must be positive")
+    if args.refresh_interval <= 0:
+        raise SystemExit("--refresh-interval must be positive")
     with EdgeStore(Path(args.state_root)) as store:
         # The daemon is the sole typed IPC owner for the explicitly physical
         # identity-provisioning operation. Keep the request-level
@@ -33,9 +36,27 @@ def main(argv: list[str] | None = None) -> int:
                                   allow_physical=True, daemon_capable=True)
         ipc = HardwareIPCServer(store, service, os.environ.get("EVOLVER_HARDWARE_SOCKET", "/run/evolver-controller/hardware.sock"))
         ipc.start()
+        last_refresh = time.monotonic()
         while True:
             poll_once(store, requested_port=args.port, service=service)
-            time.sleep(args.interval)
+            if time.monotonic() - last_refresh >= args.refresh_interval:
+                try:
+                    service.refresh_temperature_setpoints()
+                except Exception as error:
+                    # Refresh is a control-maintenance boundary: a lease,
+                    # generation, identity, or transport failure must stop
+                    # renewal and enter the typed safe-stop path without
+                    # killing the daemon loop.
+                    try:
+                        service.handle_temperature_refresh_failure(error)
+                    except Exception as safe_stop_error:
+                        store.record_hardware_observation({
+                            "source": "physical", "connection_state": "degraded",
+                            "component": "temperature_refresh", "component_state": "fault",
+                            "fault": {"kind": "temperature_refresh_safe_stop", "reason": str(safe_stop_error)[:256]},
+                            "renewal": "stopped"})
+                last_refresh = time.monotonic()
+            time.sleep(min(args.interval, args.refresh_interval))
 
 
 def poll_once(store: EdgeStore, *, requested_port: str | None,

@@ -15,19 +15,25 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import hashlib
 import fcntl
 import errno
 import glob
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Protocol
 from enum import StrEnum
 import string
+import math
 from uuid import uuid4
 from uuid import NAMESPACE_URL, uuid5
 
 from .store import EdgeStore, EdgeStoreError, Json, LeaseValidationError
+
+
+_SESSION_MUTEX = threading.Lock()
 
 
 HANDSHAKE = "WHO_ARE_YOU_!"
@@ -41,6 +47,16 @@ ACTUATOR_BOUNDS = {
     "heater_duration_ms": (1, 250),
     "heater_level": (1, 64),
 }
+TEMPERATURE_SETPOINT_PROTOCOL_VERSION = 2
+TEMPERATURE_REFRESH_SECONDS = 5.0
+TEMPERATURE_DEADMAN_SECONDS = 15.0
+# This is the wire-level raw target domain. Firmware applies its PID control
+# ceiling after decoding the raw value; the host must not confuse that
+# firmware-side limit with the transport representation's range.
+RAW_TEMPERATURE_TARGET_BOUNDS = (1, 65535)
+FIRMWARE_PID_CEILING = 64
+TEMPERATURE_CHANNEL_BOUNDS = (0, 1)
+TEMPERATURE_CORRELATION_BOUNDS = (1, 0xFFFFFFFF)
 _READ_ONLY_COMMANDS = ("HW_STATUS_!", "HW_READ_THERMISTOR,0_!", "HW_READ_THERMISTOR,1_!",
                        "HW_READ_PHOTODIODE,0_!", "HW_READ_PHOTODIODE,1_!")
 
@@ -189,9 +205,9 @@ class LocalSerialTransport:
                 # discard only the two known cross-frame forms and retain the
                 # original bounded deadline.
                 text = raw.rstrip(b"\r\n").decode(errors="replace")
-                wants_status = payload.startswith("HW_")
-                stale = ((wants_status and text.startswith("WHO_ARE_YOU|")) or
-                         (not wants_status and text.startswith("HW|")))
+                expects_hardware_reply = payload.startswith(("HW_", "TEMP|"))
+                stale = ((expects_hardware_reply and text.startswith("WHO_ARE_YOU|")) or
+                         (not expects_hardware_reply and text.startswith("HW|")))
                 if not stale or time.monotonic() >= deadline:
                     break
                 self._serial.timeout = max(0.0, deadline - time.monotonic())  # type: ignore[union-attr]
@@ -286,6 +302,17 @@ class HardwareResult:
                 "verification": self.verification, "retryable": self.retryable}
 
 
+@dataclass(frozen=True)
+class TemperatureSetpoint:
+    """An immutable, per-vial raw PID target owned by this service."""
+    channel: int
+    vial_position_id: str
+    target_c: float
+    raw_pid_target: int
+    calibration_artifact_id: str
+    calibration_artifact_digest: str
+
+
 def discover_ports(port: str | None = None) -> list[str]:
     """Only enumerate candidates; identity comes from the device handshake."""
     return [port] if port else sorted(glob.glob("/dev/ttyACM*"))
@@ -345,6 +372,46 @@ def _reply(reply: str, expected: str) -> dict[str, str]:
         raise ProbeError(ProbeOutcome.MALFORMED, "invalid hardware reply version",
                          evidence={"operation": expected.lower(), "version": parts[1]}, cause=error)
     return dict(item.split("=", 1) for item in parts[4].split(",") if "=" in item) if len(parts) > 4 else {}
+
+
+def _temperature_reply(reply: str, *, correlation: int, operation: str,
+                       channel: int, raw: int) -> dict[str, str]:
+    """Parse the secure TEMP|2 acknowledgement grammar from firmware #80."""
+    if (isinstance(correlation, bool) or not isinstance(correlation, int) or
+            not TEMPERATURE_CORRELATION_BOUNDS[0] <= correlation <= TEMPERATURE_CORRELATION_BOUNDS[1]):
+        raise ProbeError(ProbeOutcome.PROTOCOL, "temperature correlation is outside the uint32 wire domain",
+                         evidence={"operation": "temperature", "correlation": correlation})
+    parts = reply.strip().split("|")
+    if len(parts) < 5 or parts[:3] != ["TEMP", "2", "ACK"]:
+        raise ProbeError(ProbeOutcome.MALFORMED, "invalid TEMP|2 temperature acknowledgement",
+                         evidence={"operation": "temperature", "reply": reply})
+    if parts[3] != str(correlation) or parts[4] != operation:
+        raise ProbeError(ProbeOutcome.PROTOCOL, "temperature acknowledgement correlation or operation mismatch",
+                         evidence={"operation": "temperature", "reply": reply,
+                                   "expected_correlation": correlation, "expected_operation": operation})
+    fields = dict(item.split("=", 1) for item in parts[5].split(",") if "=" in item) if len(parts) > 5 else {}
+    if operation == "SET" and (fields.get("channel") != str(channel) or fields.get("raw") != str(raw)):
+        raise ProbeError(ProbeOutcome.PROTOCOL, "temperature acknowledgement target mismatch",
+                         evidence={"operation": "temperature", "reply": reply})
+    return fields
+
+
+def _temperature_wire_lease(lease_token: str) -> int:
+    """Map the opaque durable host lease to firmware's uint32 lease field."""
+    value = int(hashlib.sha256(lease_token.encode("utf-8")).hexdigest()[:8], 16)
+    return value or 1
+
+
+def _temperature_frame(*, correlation: int, item: "TemperatureSetpoint",
+                       owner: str, lease: int, generation: int) -> str:
+    if (isinstance(correlation, bool) or not isinstance(correlation, int) or
+            not TEMPERATURE_CORRELATION_BOUNDS[0] <= correlation <= TEMPERATURE_CORRELATION_BOUNDS[1]):
+        raise ValueError("temperature correlation is outside the uint32 wire domain")
+    if not TEMPERATURE_CHANNEL_BOUNDS[0] <= item.channel <= TEMPERATURE_CHANNEL_BOUNDS[1]:
+        raise ValueError("temperature channel is unsupported")
+    if not owner or len(owner) > 31 or any(char in owner for char in "|!\r\n"):
+        raise ValueError("temperature owner is not protocol-safe")
+    return (f"TEMP|2|SET|{correlation}|{item.channel}|{item.raw_pid_target}|{owner}|{lease}|{generation}_!")
 
 
 def _identity_reply(reply: str) -> DeviceIdentity:
@@ -423,21 +490,22 @@ class ReadOnlyHardwareService:
 
     @contextmanager
     def _session(self) -> Iterator[None]:
-        self._lock_path.touch(mode=0o600, exist_ok=True)
-        with self._lock_path.open("r+") as lock:
-            try:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as error:
-                raise ProbeError(ProbeOutcome.BUSY, "another eVOLVER hardware service owns serial",
-                                 evidence={"operation": "lock"}, cause=error)
-            try:
-                self.transport.open()
-                yield
-            finally:
+        with _SESSION_MUTEX:
+            self._lock_path.touch(mode=0o600, exist_ok=True)
+            with self._lock_path.open("r+") as lock:
                 try:
-                    self.transport.close()
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as error:
+                    raise ProbeError(ProbeOutcome.BUSY, "another eVOLVER hardware service owns serial",
+                                     evidence={"operation": "lock"}, cause=error)
+                try:
+                    self.transport.open()
+                    yield
                 finally:
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+                    try:
+                        self.transport.close()
+                    finally:
+                        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
     def _identity_with_startup_retry(self) -> DeviceIdentity:
         """Read identity with a bounded, immediate retry for USB reset startup.
@@ -476,8 +544,8 @@ class ReadOnlyHardwareService:
         with self._session():
             identity = self._identity_with_startup_retry()
             status = _reply(self.transport.exchange("HW_STATUS_!"), "STATUS")
-            fingerprint = (self.transport.usb_hardware_fingerprint()
-                           if isinstance(self.transport, LocalSerialTransport) else None)
+            fingerprint_reader = getattr(self.transport, "usb_hardware_fingerprint", None)
+            fingerprint = fingerprint_reader() if callable(fingerprint_reader) else None
         observation: Json = {"source": "physical", "connection_state": "connected",
                              "transport": {"kind": "usb_serial", "path": self.transport.port},
                              "firmware": identity.firmware, "hardware_protocol": identity.hw_protocol,
@@ -551,6 +619,8 @@ class HardwareService(ReadOnlyHardwareService):
                  startup_attempts: int = 3) -> None:
         super().__init__(store, transport, startup_attempts=startup_attempts)
         self.allow_physical, self.operator, self.daemon_capable = allow_physical, operator, daemon_capable
+        self._frozen_temperature_setpoints: dict[tuple[str, int], dict[str, Any]] = {}
+        self.last_temperature_refresh_command_ids: list[str] = []
 
     def _require_target(self, target_identity: str) -> DeviceIdentity:
         with self._session():
@@ -561,7 +631,7 @@ class HardwareService(ReadOnlyHardwareService):
 
     def _execute(self, request: HardwareCommand, frame: str, expected: str, *, actuator: bool = False,
                  retryable: bool = True) -> HardwareResult:
-        if request.operation not in {"get_status", "read_sensor", "safe_stop", "set_output", "pulse_pump", "set_stir", "pulse_heater"}:
+        if request.operation not in {"get_status", "read_sensor", "safe_stop", "set_output", "pulse_pump", "set_stir", "pulse_heater", "set_temperature"}:
             raise ValueError(f"unsupported hardware operation {request.operation}")
         effective_operator = request.operator or self.operator
         if actuator and (not (self.allow_physical or self.daemon_capable) or not effective_operator):
@@ -569,13 +639,18 @@ class HardwareService(ReadOnlyHardwareService):
         # Direct mock/developer service calls retain the historical physical
         # gate when no lease has ever been installed; once a lease exists, or
         # for every daemon IPC request, lease fencing is mandatory.
-        if actuator and (request.require_lease or self.store.meta("control_lease") is not None):
+        if actuator and request.operation != "safe_stop" and (
+                request.require_lease or self.store.meta("control_lease") is not None):
             self.store.validate_control_lease(lease_token=request.lease_token, owner=request.lease_owner or effective_operator,
                                               generation=request.controller_generation)
         if request.timeout <= 0:
             raise ValueError("timeout must be positive")
         def handler() -> dict[str, Any]:
             try:
+                if request.operation == "safe_stop" and not any(
+                        item.get("device_identity") == request.target_identity
+                        for item in self.store.list_instruments()):
+                    raise HardwareUnavailableError("target device identity is not registered")
                 with self._session():
                     identity = _identity_reply(self.transport.exchange(HANDSHAKE))
                     if not identity.provisioned or identity.device_id != request.target_identity:
@@ -592,7 +667,7 @@ class HardwareService(ReadOnlyHardwareService):
                     "component": component, "component_state": "fault", "fault": {"kind": "actuator_protocol", "reason": str(error)},
                     "command_id": request.command_id, "controller_generation": request.controller_generation})
                 return HardwareResult(request.command_id, False, str(error),
-                                      {"component": component, "fault": str(error), "operator": self.operator},
+                                      {"component": component, "fault": str(error), "operator": effective_operator},
                                       "protocol_failed", False).as_json()
         result = self.store.execute_command({"command_id": request.command_id,
                                               "controller_generation": request.controller_generation}, handler)
@@ -608,6 +683,8 @@ class HardwareService(ReadOnlyHardwareService):
             return self._execute(request, "HW_STATUS_!", "STATUS")
         if request.operation == "safe_stop":
             return self._execute(request, "HW_SAFE_!", "SAFE", actuator=True, retryable=True)
+        if request.operation == "set_temperature":
+            raise ValueError("set_temperature requires the service setpoint path")
         channel = p.get("channel")
         if not isinstance(channel, int) or channel < 0:
             raise ValueError("channel must be a non-negative integer")
@@ -639,7 +716,7 @@ class HardwareService(ReadOnlyHardwareService):
             # carry its current generation so the store can fence them. An
             # explicit generation is left untouched for normal stale checks.
             context["controller_generation"] = binding.get("generation", 0) if isinstance(binding, dict) else 0
-            if operation in {"safe_stop", "set_output", "pulse_pump", "set_stir", "pulse_heater"}:
+            if operation in {"safe_stop", "set_output", "pulse_pump", "set_stir", "pulse_heater", "set_temperature"}:
                 if (self.allow_physical or self.daemon_capable) and self.operator and (
                         not isinstance(binding, dict) or not isinstance(binding.get("generation"), int) or binding["generation"] <= 0):
                     raise EdgeStoreError("physical actuation requires an active positive controller generation")
@@ -648,6 +725,204 @@ class HardwareService(ReadOnlyHardwareService):
                                              requested_at=context.pop("requested_at", datetime.now(UTC).isoformat()),
                                              lease_token=context.pop("lease_token", None), lease_owner=context.pop("lease_owner", None),
                                              operator=context.pop("operator", None), **context))
+
+    def _temperature_setpoints(self, instrument_id: str, parameters: Mapping[str, Any]) -> tuple[TemperatureSetpoint, ...]:
+        """Validate and freeze one canonical per-vial target before serial I/O."""
+        target = parameters.get("temperature_c", parameters.get("target_temperature"))
+        if isinstance(target, bool) or not isinstance(target, (int, float)) or not math.isfinite(float(target)) or not 0 <= float(target) <= 100:
+            raise ValueError("temperature_c must be finite and between 0 and 100")
+        instrument = self.store.instrument(instrument_id)
+        positions = instrument.get("vial_positions")
+        vial_id = parameters.get("vial_position_id")
+        channel = parameters.get("channel")
+        supplied_raw = parameters.get("raw_target_adc")
+        calibration = parameters.get("calibration")
+        if not isinstance(positions, list) or not positions:
+            raise ValueError("instrument has no vial positions")
+        if not isinstance(vial_id, str) or not vial_id:
+            raise ValueError("set_temperature requires vial_position_id")
+        if (isinstance(channel, bool) or not isinstance(channel, int) or
+                not TEMPERATURE_CHANNEL_BOUNDS[0] <= channel <= TEMPERATURE_CHANNEL_BOUNDS[1]):
+            raise ValueError("temperature channel is unsupported")
+        if (isinstance(supplied_raw, bool) or not isinstance(supplied_raw, int) or
+                not RAW_TEMPERATURE_TARGET_BOUNDS[0] <= supplied_raw <= RAW_TEMPERATURE_TARGET_BOUNDS[1]):
+            raise ValueError("raw_target_adc is outside the transport domain")
+        if not isinstance(calibration, Mapping):
+            raise ValueError("set_temperature requires one calibration summary")
+        position = next((item for item in positions if str(item.get("id", "")) == vial_id), None)
+        if not isinstance(position, Mapping):
+            raise ValueError("vial_position_id is not registered for the instrument")
+        if position.get("position_index") != channel:
+            raise ValueError("temperature channel does not match vial position")
+        hardware_fingerprint = instrument.get("hardware_fingerprint")
+        if not isinstance(hardware_fingerprint, Mapping) or not hardware_fingerprint:
+            raise ValueError("temperature calibration requires an immutable hardware fingerprint")
+        artifact_id, digest = calibration.get("artifact_id"), calibration.get("artifact_digest")
+        if not all(isinstance(value, str) and value for value in (artifact_id, digest)):
+            raise ValueError("temperature calibration identity is incomplete")
+        if calibration.get("calibration_type") != "temperature" or calibration.get("status", calibration.get("assessment", {}).get("status")) not in {"valid", "accepted"}:
+            raise ValueError("temperature calibration is not valid")
+        artifact = next((item for item in self.store.calibration_artifacts(instrument_id=instrument_id)
+                         if isinstance(item, Mapping) and item.get("id") == artifact_id), None)
+        if (not isinstance(artifact, Mapping) or artifact.get("artifact_digest") != digest or
+                artifact.get("instrument_id") != instrument_id or artifact.get("vial_position_id") != vial_id or
+                artifact.get("calibration_type") != "temperature" or artifact.get("method") != "temperature_linear_v1" or
+                artifact.get("method_version") != "1" or artifact.get("hardware_fingerprint") != dict(hardware_fingerprint) or
+                calibration.get("hardware_fingerprint") != dict(hardware_fingerprint)):
+            raise ValueError("temperature calibration lacks immutable authority or hardware fingerprint binding")
+        coefficients, ranges = artifact.get("coefficients"), artifact.get("calibration_range")
+        if not isinstance(coefficients, Mapping) or not isinstance(ranges, Mapping):
+            raise ValueError("temperature calibration canonical schema is incomplete")
+        slope, intercept = coefficients.get("slope"), coefficients.get("intercept")
+        required_ranges = ("raw_min", "raw_max", "reference_min", "reference_max")
+        if (any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value))
+                for value in (slope, intercept)) or float(slope) <= 0 or
+                any(isinstance(ranges.get(name), bool) or not isinstance(ranges.get(name), (int, float)) or
+                    not math.isfinite(float(ranges.get(name))) for name in required_ranges)):
+            raise ValueError("temperature calibration canonical coefficients or range is invalid")
+        raw = round((float(target) - float(intercept)) / float(slope))
+        if not (float(ranges["raw_min"]) <= raw <= float(ranges["raw_max"]) and
+                float(ranges["reference_min"]) <= float(target) <= float(ranges["reference_max"])):
+            raise ValueError("temperature target is outside immutable calibration range")
+        if raw != supplied_raw:
+            raise ValueError("raw_target_adc does not match immutable calibration")
+        return (TemperatureSetpoint(channel, vial_id, float(target), raw, artifact_id, digest),)
+
+    def set_temperature(self, instrument_id: str, parameters: Mapping[str, Any], **context: Any) -> HardwareResult:
+        """Apply a calibrated Celsius setpoint and retain only volatile refresh state."""
+        if not self.allow_physical and not self.daemon_capable:
+            raise PermissionError("physical actuation requires --physical and operator attribution")
+        frozen = self._temperature_setpoints(instrument_id, parameters)
+        operator = context.get("operator") or self.operator
+        if not operator:
+            raise PermissionError("temperature setpoint requires operator attribution")
+        command = HardwareCommand("set_temperature", context.pop("command_id", str(uuid4())),
+                                  str(self.store.instrument(instrument_id).get("device_identity", "")),
+                                  dict(parameters), controller_generation=int(context.pop("controller_generation", 0)),
+                                  lease_token=context.pop("lease_token", None), lease_owner=context.pop("lease_owner", operator),
+                                  operator=operator, require_lease=bool(context.pop("require_lease", False)))
+        self.store.validate_control_lease(lease_token=command.lease_token, owner=command.lease_owner,
+                                          generation=command.controller_generation)
+        wire_lease = _temperature_wire_lease(command.lease_token or "")
+        def handler() -> dict[str, Any]:
+            frames = tuple(_temperature_frame(
+                correlation=self.store.next_cursor("temperature_wire_correlation"), item=item,
+                owner=command.lease_owner or operator, lease=wire_lease,
+                generation=command.controller_generation) for item in frozen)
+            with self._session():
+                identity = _identity_reply(self.transport.exchange(HANDSHAKE))
+                if not identity.provisioned or identity.device_id != command.target_identity:
+                    raise HardwareUnavailableError("attached device identity does not match command target")
+                if identity.hw_protocol < TEMPERATURE_SETPOINT_PROTOCOL_VERSION:
+                    raise HardwareUnavailableError("temperature setpoint requires hardware protocol v2")
+                fingerprint_reader = getattr(self.transport, "usb_hardware_fingerprint", None)
+                fingerprint = fingerprint_reader() if callable(fingerprint_reader) else None
+                expected_fingerprint = self.store.instrument(instrument_id).get("hardware_fingerprint")
+                if fingerprint != expected_fingerprint:
+                    raise HardwareUnavailableError("attached device hardware fingerprint does not match calibration authority")
+                replies = [self.transport.exchange(frame) for frame in frames]
+            for frame, reply in zip(frames, replies):
+                fields = frame.removesuffix("_!").split("|")
+                _temperature_reply(reply, correlation=int(fields[3]), operation="SET",
+                                   channel=int(fields[4]), raw=int(fields[5]))
+            self._frozen_temperature_setpoints[(instrument_id, frozen[0].channel)] = {
+                "setpoints": frozen,
+                "target_identity": command.target_identity,
+                "operator": operator,
+                "lease_owner": command.lease_owner or operator,
+                "lease_token": command.lease_token,
+                "wire_lease": wire_lease,
+                "hardware_fingerprint": self.store.instrument(instrument_id).get("hardware_fingerprint"),
+                "controller_generation": command.controller_generation,
+            }
+            return HardwareResult(command.command_id, True, replies[-1],
+                                  {"operator": operator, "channels": len(frozen),
+                                   "refresh_seconds": TEMPERATURE_REFRESH_SECONDS,
+                                   "calibrations": [item.calibration_artifact_digest for item in frozen],
+                                   "hardware_fingerprint": fingerprint},
+                                  "protocol_verified", True).as_json()
+        result = self.store.execute_command({"command_id": command.command_id,
+                                              "controller_generation": command.controller_generation,
+                                              "expected_device": command.target_identity,
+                                              "requested_device": command.target_identity,
+                                              "requested_owner": command.lease_owner or operator,
+                                              "operator": operator}, handler)
+        return HardwareResult(result["command_id"], result["request_accepted"], result["protocol_response"],
+                              result["observed_evidence"], result["verification"], result["retryable"])
+
+    def refresh_temperature_setpoints(self) -> list[HardwareResult]:
+        """Refresh volatile PID targets; firmware's 15-second dead-man owns expiry."""
+        refreshed: list[HardwareResult] = []
+        for (_instrument_id, _channel), state in tuple(self._frozen_temperature_setpoints.items()):
+            setpoints = state["setpoints"]
+            self.store.validate_control_lease(
+                lease_token=state["lease_token"], owner=state["lease_owner"],
+                generation=state["controller_generation"])
+            command_id = str(uuid4())
+            wire_lease = int(state["wire_lease"])
+            frames = tuple(_temperature_frame(
+                correlation=self.store.next_cursor("temperature_wire_correlation"), item=item,
+                owner=state["lease_owner"], lease=wire_lease,
+                generation=state["controller_generation"]) for item in setpoints)
+            def handler() -> dict[str, Any]:
+                try:
+                    with self._session():
+                        identity = _identity_reply(self.transport.exchange(HANDSHAKE))
+                        if (identity.device_id != state["target_identity"] or
+                                identity.hw_protocol < TEMPERATURE_SETPOINT_PROTOCOL_VERSION):
+                            raise HardwareUnavailableError("temperature refresh identity mismatch")
+                        fingerprint_reader = getattr(self.transport, "usb_hardware_fingerprint", None)
+                        fingerprint = fingerprint_reader() if callable(fingerprint_reader) else None
+                        if fingerprint != state["hardware_fingerprint"]:
+                            raise HardwareUnavailableError("temperature refresh hardware fingerprint mismatch")
+                        replies = [self.transport.exchange(frame) for frame in frames]
+                    for frame, reply in zip(frames, replies):
+                        fields = frame.removesuffix("_!").split("|")
+                        _temperature_reply(reply, correlation=int(fields[3]), operation="SET",
+                                           channel=int(fields[4]), raw=int(fields[5]))
+                    return HardwareResult(command_id, True, replies[-1],
+                                          {"device_id": state["target_identity"], "operator": state["operator"],
+                                           "channels": len(frames), "refresh_seconds": TEMPERATURE_REFRESH_SECONDS,
+                                           "deadman_seconds": TEMPERATURE_DEADMAN_SECONDS,
+                                           "refresh_correlation_id": command_id,
+                                           "hardware_fingerprint": state["hardware_fingerprint"]},
+                                          "protocol_verified", True).as_json()
+                except (HardwareUnavailableError, ValueError) as error:
+                    return HardwareResult(command_id, False, str(error),
+                                          {"device_id": state["target_identity"], "operator": state["operator"],
+                                           "fault": str(error)[:256], "refresh_correlation_id": command_id},
+                                          "protocol_failed", False).as_json()
+            result = self.store.execute_command({
+                "command_id": command_id, "controller_generation": state["controller_generation"],
+                "expected_device": state["target_identity"], "requested_device": state["target_identity"],
+                "requested_owner": state["lease_owner"], "operator": state["operator"]}, handler)
+            self.last_temperature_refresh_command_ids.append(command_id)
+            if not result["request_accepted"]:
+                raise HardwareUnavailableError(result["protocol_response"], evidence=result["observed_evidence"])
+            refreshed.append(HardwareResult(result["command_id"], result["request_accepted"], result["protocol_response"],
+                                            result["observed_evidence"], result["verification"], result["retryable"]))
+        return refreshed
+
+    def handle_temperature_refresh_failure(self, error: BaseException) -> list[HardwareResult]:
+        """Record a failed refresh, stop renewal, and issue typed safe-stop."""
+        states = tuple(self._frozen_temperature_setpoints.values())
+        self._frozen_temperature_setpoints.clear()
+        self.store.record_hardware_observation({
+            "source": "physical", "connection_state": "degraded", "component": "temperature_refresh",
+            "component_state": "fault", "fault": {"kind": "temperature_refresh", "reason": str(error)[:256]},
+            "renewal": "stopped"})
+        results: list[HardwareResult] = []
+        binding = self.store.binding() or {}
+        generation = int(binding.get("generation", 0))
+        stopped_targets: set[str] = set()
+        for state in states:
+            if state["target_identity"] in stopped_targets:
+                continue
+            stopped_targets.add(state["target_identity"])
+            results.append(self.command("safe_stop", state["target_identity"], {},
+                                        command_id=str(uuid4()), operator=state["operator"],
+                                        controller_generation=generation))
+        return results
 
     def provision_identity(self, *, device_id: str, owner_id: str, operator: str,
                            command_id: str | None = None) -> HardwareResult:
@@ -746,13 +1021,18 @@ def _capabilities() -> Json:
                              "duration_ms": {"minimum": 1, "maximum": 1000}},
             "heater_control": {"verification": "not_tested", "enabled": False, "supported": True,
                                "mode": "output_pulse", "temperature_setpoint": {"supported": False, "reason": "firmware commissioning protocol exposes heater output, not a target"}},
-            "temperature_setpoint": {"supported": False, "reason": "firmware does not expose a temperature-setpoint operation"},
+            "temperature_setpoint": {"supported": True, "protocol_version": TEMPERATURE_SETPOINT_PROTOCOL_VERSION,
+                                      "refresh_seconds": TEMPERATURE_REFRESH_SECONDS, "deadman_seconds": TEMPERATURE_DEADMAN_SECONDS,
+                                      "raw_pid_target": {"minimum": RAW_TEMPERATURE_TARGET_BOUNDS[0],
+                                                         "maximum": RAW_TEMPERATURE_TARGET_BOUNDS[1]},
+                                      "firmware_pid_ceiling": FIRMWARE_PID_CEILING,
+                                      "calibration": "per_vial_immutable"},
             "safe_stop": {"supported": True, "enabled": False, "scope": "all_outputs"}}
 
 
 def validate_device_operation(operation: str, parameters: Mapping[str, Any]) -> None:
     """Reject unsupported actuator semantics before identity/serial I/O."""
-    if operation not in {"get_status", "read_sensor", "safe_stop", "set_output", "pulse_pump", "set_stir", "pulse_heater"}:
+    if operation not in {"get_status", "read_sensor", "safe_stop", "set_output", "pulse_pump", "set_stir", "pulse_heater", "set_temperature"}:
         raise ValueError(f"unsupported device operation {operation}")
     if operation == "pulse_pump" and parameters.get("direction", "forward") != "forward":
         raise ValueError("reverse pumping is unsupported by verified firmware")

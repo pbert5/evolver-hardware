@@ -974,6 +974,18 @@ class EdgeStore:
         row = self._connection.execute("SELECT value FROM cursors WHERE name=?", (name,)).fetchone()
         return row["value"] if row else str(default)
 
+    def next_cursor(self, name: str, *, minimum: int = 1, maximum: int = 0xFFFFFFFF) -> int:
+        """Atomically allocate a bounded monotonic wire-protocol cursor."""
+        with self._transaction() as cursor:
+            row = cursor.execute("SELECT value FROM cursors WHERE name=?", (name,)).fetchone()
+            current = int(row["value"]) if row else minimum - 1
+            value = current + 1
+            if value < minimum or value > maximum:
+                raise EdgeStoreError(f"cursor {name} is exhausted")
+            cursor.execute("INSERT INTO cursors VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+                           (name, str(value)))
+            return value
+
     def set_meta(self, key: str, value: Any) -> None:
         """Persist small controller-local settings, never credentials in output."""
         with self._transaction() as cursor:
@@ -993,7 +1005,8 @@ class EdgeStore:
                  "owner": owner, "generation": generation, "expires_at": expires_at}
         self.set_meta("control_lease", value)
 
-    def acquire_local_commissioning_lease(self, owner: str, ttl_seconds: int = 900) -> Json:
+    def acquire_local_commissioning_lease(self, owner: str, ttl_seconds: int = 900,
+                                          controller_generation: int | None = None) -> Json:
         """Issue a bounded host-local maintenance lease for the IPC service."""
         if not owner or not isinstance(owner, str):
             raise LeaseValidationError("commissioning lease owner is required")
@@ -1010,7 +1023,12 @@ class EdgeStore:
             except (KeyError, ValueError, TypeError):
                 pass
         binding = self.binding() or {}
-        generation = int(binding.get("generation", 0))
+        if controller_generation is None:
+            generation = int(binding.get("generation", 0))
+        else:
+            if isinstance(controller_generation, bool) or controller_generation < 0:
+                raise LeaseValidationError("controller generation must be a non-negative integer")
+            generation = controller_generation
         token = secrets.token_urlsafe(32)
         expires = (datetime.now(UTC).timestamp() + ttl_seconds)
         expires_at = datetime.fromtimestamp(expires, UTC).isoformat()
