@@ -40,7 +40,21 @@ def main(argv: list[str] | None = None) -> int:
         while True:
             poll_once(store, requested_port=args.port, service=service)
             if time.monotonic() - last_refresh >= args.refresh_interval:
-                service.refresh_temperature_setpoints()
+                try:
+                    service.refresh_temperature_setpoints()
+                except Exception as error:
+                    # Refresh is a control-maintenance boundary: a lease,
+                    # generation, identity, or transport failure must stop
+                    # renewal and enter the typed safe-stop path without
+                    # killing the daemon loop.
+                    try:
+                        service.handle_temperature_refresh_failure(error)
+                    except Exception as safe_stop_error:
+                        store.record_hardware_observation({
+                            "source": "physical", "connection_state": "degraded",
+                            "component": "temperature_refresh", "component_state": "fault",
+                            "fault": {"kind": "temperature_refresh_safe_stop", "reason": str(safe_stop_error)[:256]},
+                            "renewal": "stopped"})
                 last_refresh = time.monotonic()
             time.sleep(min(args.interval, args.refresh_interval))
 

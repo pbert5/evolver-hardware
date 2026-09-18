@@ -572,7 +572,8 @@ class HardwareService(ReadOnlyHardwareService):
                  startup_attempts: int = 3) -> None:
         super().__init__(store, transport, startup_attempts=startup_attempts)
         self.allow_physical, self.operator, self.daemon_capable = allow_physical, operator, daemon_capable
-        self._frozen_temperature_setpoints: dict[str, tuple[TemperatureSetpoint, ...]] = {}
+        self._frozen_temperature_setpoints: dict[str, dict[str, Any]] = {}
+        self.last_temperature_refresh_command_ids: list[str] = []
 
     def _require_target(self, target_identity: str) -> DeviceIdentity:
         with self._session():
@@ -740,35 +741,85 @@ class HardwareService(ReadOnlyHardwareService):
                 replies = [self.transport.exchange(frame) for frame in frames]
             for reply in replies:
                 _reply(reply, "TEMP_V2")
-            self._frozen_temperature_setpoints[instrument_id] = frozen
+            self._frozen_temperature_setpoints[instrument_id] = {
+                "setpoints": frozen,
+                "target_identity": command.target_identity,
+                "operator": operator,
+                "lease_owner": command.lease_owner or operator,
+                "lease_token": command.lease_token,
+                "controller_generation": command.controller_generation,
+            }
             return HardwareResult(command.command_id, True, replies[-1],
                                   {"operator": operator, "channels": len(frozen),
                                    "refresh_seconds": TEMPERATURE_REFRESH_SECONDS,
                                    "calibrations": [item.calibration_artifact_digest for item in frozen]},
                                   "protocol_verified", True).as_json()
         result = self.store.execute_command({"command_id": command.command_id,
-                                              "controller_generation": command.controller_generation}, handler)
+                                              "controller_generation": command.controller_generation,
+                                              "expected_device": command.target_identity,
+                                              "requested_device": command.target_identity,
+                                              "requested_owner": command.lease_owner or operator,
+                                              "operator": operator}, handler)
         return HardwareResult(result["command_id"], result["request_accepted"], result["protocol_response"],
                               result["observed_evidence"], result["verification"], result["retryable"])
 
     def refresh_temperature_setpoints(self) -> list[HardwareResult]:
         """Refresh volatile PID targets; firmware's 15-second dead-man owns expiry."""
         refreshed: list[HardwareResult] = []
-        for instrument_id, setpoints in tuple(self._frozen_temperature_setpoints.items()):
+        for instrument_id, state in tuple(self._frozen_temperature_setpoints.items()):
+            setpoints = state["setpoints"]
+            self.store.validate_control_lease(
+                lease_token=state["lease_token"], owner=state["lease_owner"],
+                generation=state["controller_generation"])
+            command_id = str(uuid4())
             frames = tuple(f"HW_TEMP_V2,{item.channel},{item.raw_pid_target}_!" for item in setpoints)
-            with self._session():
-                identity = _identity_reply(self.transport.exchange(HANDSHAKE))
-                instrument = self.store.instrument(instrument_id)
-                if identity.device_id != instrument.get("device_identity"):
-                    raise HardwareUnavailableError("temperature refresh identity mismatch")
-                replies = [self.transport.exchange(frame) for frame in frames]
-            for reply in replies:
-                _reply(reply, "TEMP_V2")
-            refreshed.append(HardwareResult(str(uuid4()), True, replies[-1],
-                                            {"channels": len(frames), "refresh_seconds": TEMPERATURE_REFRESH_SECONDS,
-                                             "deadman_seconds": TEMPERATURE_DEADMAN_SECONDS},
-                                            "protocol_verified", True))
+            def handler() -> dict[str, Any]:
+                try:
+                    with self._session():
+                        identity = _identity_reply(self.transport.exchange(HANDSHAKE))
+                        if identity.device_id != state["target_identity"]:
+                            raise HardwareUnavailableError("temperature refresh identity mismatch")
+                        replies = [self.transport.exchange(frame) for frame in frames]
+                    for reply in replies:
+                        _reply(reply, "TEMP_V2")
+                    return HardwareResult(command_id, True, replies[-1],
+                                          {"device_id": state["target_identity"], "operator": state["operator"],
+                                           "channels": len(frames), "refresh_seconds": TEMPERATURE_REFRESH_SECONDS,
+                                           "deadman_seconds": TEMPERATURE_DEADMAN_SECONDS,
+                                           "refresh_correlation_id": command_id},
+                                          "protocol_verified", True).as_json()
+                except (HardwareUnavailableError, ValueError) as error:
+                    return HardwareResult(command_id, False, str(error),
+                                          {"device_id": state["target_identity"], "operator": state["operator"],
+                                           "fault": str(error)[:256], "refresh_correlation_id": command_id},
+                                          "protocol_failed", False).as_json()
+            result = self.store.execute_command({
+                "command_id": command_id, "controller_generation": state["controller_generation"],
+                "expected_device": state["target_identity"], "requested_device": state["target_identity"],
+                "requested_owner": state["lease_owner"], "operator": state["operator"]}, handler)
+            self.last_temperature_refresh_command_ids.append(command_id)
+            if not result["request_accepted"]:
+                raise HardwareUnavailableError(result["protocol_response"], evidence=result["observed_evidence"])
+            refreshed.append(HardwareResult(result["command_id"], result["request_accepted"], result["protocol_response"],
+                                            result["observed_evidence"], result["verification"], result["retryable"]))
         return refreshed
+
+    def handle_temperature_refresh_failure(self, error: BaseException) -> list[HardwareResult]:
+        """Record a failed refresh, stop renewal, and issue typed safe-stop."""
+        states = tuple(self._frozen_temperature_setpoints.values())
+        self._frozen_temperature_setpoints.clear()
+        self.store.record_hardware_observation({
+            "source": "physical", "connection_state": "degraded", "component": "temperature_refresh",
+            "component_state": "fault", "fault": {"kind": "temperature_refresh", "reason": str(error)[:256]},
+            "renewal": "stopped"})
+        results: list[HardwareResult] = []
+        binding = self.store.binding() or {}
+        generation = int(binding.get("generation", 0))
+        for state in states:
+            results.append(self.command("safe_stop", state["target_identity"], {},
+                                        command_id=str(uuid4()), operator=state["operator"],
+                                        controller_generation=generation))
+        return results
 
     def provision_identity(self, *, device_id: str, owner_id: str, operator: str,
                            command_id: str | None = None) -> HardwareResult:
