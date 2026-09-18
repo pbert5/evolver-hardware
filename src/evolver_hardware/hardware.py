@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping, Protocol
 from enum import StrEnum
 import string
+import math
 from uuid import uuid4
 from uuid import NAMESPACE_URL, uuid5
 
@@ -45,6 +46,10 @@ ACTUATOR_BOUNDS = {
     "heater_duration_ms": (1, 250),
     "heater_level": (1, 64),
 }
+TEMPERATURE_SETPOINT_PROTOCOL_VERSION = 2
+TEMPERATURE_REFRESH_SECONDS = 5.0
+TEMPERATURE_DEADMAN_SECONDS = 15.0
+FIRMWARE_PID_TARGET_BOUNDS = (0, 64)
 _READ_ONLY_COMMANDS = ("HW_STATUS_!", "HW_READ_THERMISTOR,0_!", "HW_READ_THERMISTOR,1_!",
                        "HW_READ_PHOTODIODE,0_!", "HW_READ_PHOTODIODE,1_!")
 
@@ -288,6 +293,17 @@ class HardwareResult:
         return {"command_id": self.command_id, "request_accepted": self.request_accepted,
                 "protocol_response": self.protocol_response, "observed_evidence": dict(self.observed_evidence),
                 "verification": self.verification, "retryable": self.retryable}
+
+
+@dataclass(frozen=True)
+class TemperatureSetpoint:
+    """An immutable, per-vial raw PID target owned by this service."""
+    channel: int
+    vial_position_id: str
+    target_c: float
+    raw_pid_target: int
+    calibration_artifact_id: str
+    calibration_artifact_digest: str
 
 
 def discover_ports(port: str | None = None) -> list[str]:
@@ -556,6 +572,7 @@ class HardwareService(ReadOnlyHardwareService):
                  startup_attempts: int = 3) -> None:
         super().__init__(store, transport, startup_attempts=startup_attempts)
         self.allow_physical, self.operator, self.daemon_capable = allow_physical, operator, daemon_capable
+        self._frozen_temperature_setpoints: dict[str, tuple[TemperatureSetpoint, ...]] = {}
 
     def _require_target(self, target_identity: str) -> DeviceIdentity:
         with self._session():
@@ -566,7 +583,7 @@ class HardwareService(ReadOnlyHardwareService):
 
     def _execute(self, request: HardwareCommand, frame: str, expected: str, *, actuator: bool = False,
                  retryable: bool = True) -> HardwareResult:
-        if request.operation not in {"get_status", "read_sensor", "safe_stop", "set_output", "pulse_pump", "set_stir", "pulse_heater"}:
+        if request.operation not in {"get_status", "read_sensor", "safe_stop", "set_output", "pulse_pump", "set_stir", "pulse_heater", "set_temperature"}:
             raise ValueError(f"unsupported hardware operation {request.operation}")
         effective_operator = request.operator or self.operator
         if actuator and (not (self.allow_physical or self.daemon_capable) or not effective_operator):
@@ -618,6 +635,8 @@ class HardwareService(ReadOnlyHardwareService):
             return self._execute(request, "HW_STATUS_!", "STATUS")
         if request.operation == "safe_stop":
             return self._execute(request, "HW_SAFE_!", "SAFE", actuator=True, retryable=True)
+        if request.operation == "set_temperature":
+            raise ValueError("set_temperature requires the service setpoint path")
         channel = p.get("channel")
         if not isinstance(channel, int) or channel < 0:
             raise ValueError("channel must be a non-negative integer")
@@ -649,7 +668,7 @@ class HardwareService(ReadOnlyHardwareService):
             # carry its current generation so the store can fence them. An
             # explicit generation is left untouched for normal stale checks.
             context["controller_generation"] = binding.get("generation", 0) if isinstance(binding, dict) else 0
-            if operation in {"safe_stop", "set_output", "pulse_pump", "set_stir", "pulse_heater"}:
+            if operation in {"safe_stop", "set_output", "pulse_pump", "set_stir", "pulse_heater", "set_temperature"}:
                 if (self.allow_physical or self.daemon_capable) and self.operator and (
                         not isinstance(binding, dict) or not isinstance(binding.get("generation"), int) or binding["generation"] <= 0):
                     raise EdgeStoreError("physical actuation requires an active positive controller generation")
@@ -658,6 +677,98 @@ class HardwareService(ReadOnlyHardwareService):
                                              requested_at=context.pop("requested_at", datetime.now(UTC).isoformat()),
                                              lease_token=context.pop("lease_token", None), lease_owner=context.pop("lease_owner", None),
                                              operator=context.pop("operator", None), **context))
+
+    def _temperature_setpoints(self, instrument_id: str, parameters: Mapping[str, Any]) -> tuple[TemperatureSetpoint, ...]:
+        """Validate and freeze all calibration inputs before opening serial."""
+        target = parameters.get("temperature_c", parameters.get("target_temperature"))
+        if isinstance(target, bool) or not isinstance(target, (int, float)) or not math.isfinite(float(target)) or not 0 <= float(target) <= 100:
+            raise ValueError("temperature_c must be finite and between 0 and 100")
+        instrument = self.store.instrument(instrument_id)
+        positions = instrument.get("vial_positions")
+        calibrations = parameters.get("calibrations")
+        if not isinstance(positions, list) or not positions or not isinstance(calibrations, (list, tuple, dict)):
+            raise ValueError("set_temperature requires one calibration for every vial")
+        if isinstance(calibrations, dict):
+            entries = [{"vial_position_id": key, **(value if isinstance(value, Mapping) else {})}
+                       for key, value in calibrations.items()]
+        else:
+            entries = [dict(item) for item in calibrations if isinstance(item, Mapping)]
+        by_vial = {str(item.get("vial_position_id")): item for item in entries}
+        if len(entries) != len(by_vial) or set(by_vial) != {str(position.get("id", "")) for position in positions}:
+            raise ValueError("temperature calibration must exactly cover every vial")
+        result: list[TemperatureSetpoint] = []
+        for channel, position in enumerate(positions):
+            vial_id = str(position.get("id", ""))
+            calibration = by_vial.get(vial_id)
+            if calibration is None:
+                raise ValueError("temperature calibration is missing or duplicated")
+            if calibration.get("calibration_type", "temperature") != "temperature" or calibration.get("status", calibration.get("assessment", {}).get("status")) not in {"valid", "accepted"}:
+                raise ValueError("temperature calibration is not valid")
+            artifact_id, digest = calibration.get("artifact_id", calibration.get("id")), calibration.get("artifact_digest")
+            slope, intercept = calibration.get("slope"), calibration.get("intercept", 0.0)
+            if not all(isinstance(value, str) and value for value in (artifact_id, digest)):
+                raise ValueError("temperature calibration identity is incomplete")
+            if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) for value in (slope, intercept)) or float(slope) <= 0:
+                raise ValueError("temperature calibration coefficients are invalid")
+            raw = round((float(target) - float(intercept)) / float(slope))
+            if not FIRMWARE_PID_TARGET_BOUNDS[0] <= raw <= FIRMWARE_PID_TARGET_BOUNDS[1]:
+                raise ValueError("temperature calibration produces an out-of-range firmware PID target")
+            result.append(TemperatureSetpoint(channel, vial_id, float(target), raw, artifact_id, digest))
+        return tuple(result)
+
+    def set_temperature(self, instrument_id: str, parameters: Mapping[str, Any], **context: Any) -> HardwareResult:
+        """Apply a calibrated Celsius setpoint and retain only volatile refresh state."""
+        if not self.allow_physical and not self.daemon_capable:
+            raise PermissionError("physical actuation requires --physical and operator attribution")
+        frozen = self._temperature_setpoints(instrument_id, parameters)
+        operator = context.get("operator") or self.operator
+        if not operator:
+            raise PermissionError("temperature setpoint requires operator attribution")
+        command = HardwareCommand("set_temperature", context.pop("command_id", str(uuid4())),
+                                  str(self.store.instrument(instrument_id).get("device_identity", "")),
+                                  dict(parameters), controller_generation=int(context.pop("controller_generation", 0)),
+                                  lease_token=context.pop("lease_token", None), lease_owner=context.pop("lease_owner", operator),
+                                  operator=operator, require_lease=bool(context.pop("require_lease", False)))
+        self.store.validate_control_lease(lease_token=command.lease_token, owner=command.lease_owner,
+                                          generation=command.controller_generation)
+        frames = tuple(f"HW_TEMP_V2,{item.channel},{item.raw_pid_target}_!" for item in frozen)
+        def handler() -> dict[str, Any]:
+            with self._session():
+                identity = _identity_reply(self.transport.exchange(HANDSHAKE))
+                if not identity.provisioned or identity.device_id != command.target_identity:
+                    raise HardwareUnavailableError("attached device identity does not match command target")
+                replies = [self.transport.exchange(frame) for frame in frames]
+            for reply in replies:
+                _reply(reply, "TEMP_V2")
+            self._frozen_temperature_setpoints[instrument_id] = frozen
+            return HardwareResult(command.command_id, True, replies[-1],
+                                  {"operator": operator, "channels": len(frozen),
+                                   "refresh_seconds": TEMPERATURE_REFRESH_SECONDS,
+                                   "calibrations": [item.calibration_artifact_digest for item in frozen]},
+                                  "protocol_verified", True).as_json()
+        result = self.store.execute_command({"command_id": command.command_id,
+                                              "controller_generation": command.controller_generation}, handler)
+        return HardwareResult(result["command_id"], result["request_accepted"], result["protocol_response"],
+                              result["observed_evidence"], result["verification"], result["retryable"])
+
+    def refresh_temperature_setpoints(self) -> list[HardwareResult]:
+        """Refresh volatile PID targets; firmware's 15-second dead-man owns expiry."""
+        refreshed: list[HardwareResult] = []
+        for instrument_id, setpoints in tuple(self._frozen_temperature_setpoints.items()):
+            frames = tuple(f"HW_TEMP_V2,{item.channel},{item.raw_pid_target}_!" for item in setpoints)
+            with self._session():
+                identity = _identity_reply(self.transport.exchange(HANDSHAKE))
+                instrument = self.store.instrument(instrument_id)
+                if identity.device_id != instrument.get("device_identity"):
+                    raise HardwareUnavailableError("temperature refresh identity mismatch")
+                replies = [self.transport.exchange(frame) for frame in frames]
+            for reply in replies:
+                _reply(reply, "TEMP_V2")
+            refreshed.append(HardwareResult(str(uuid4()), True, replies[-1],
+                                            {"channels": len(frames), "refresh_seconds": TEMPERATURE_REFRESH_SECONDS,
+                                             "deadman_seconds": TEMPERATURE_DEADMAN_SECONDS},
+                                            "protocol_verified", True))
+        return refreshed
 
     def provision_identity(self, *, device_id: str, owner_id: str, operator: str,
                            command_id: str | None = None) -> HardwareResult:
@@ -756,13 +867,15 @@ def _capabilities() -> Json:
                              "duration_ms": {"minimum": 1, "maximum": 1000}},
             "heater_control": {"verification": "not_tested", "enabled": False, "supported": True,
                                "mode": "output_pulse", "temperature_setpoint": {"supported": False, "reason": "firmware commissioning protocol exposes heater output, not a target"}},
-            "temperature_setpoint": {"supported": False, "reason": "firmware does not expose a temperature-setpoint operation"},
+            "temperature_setpoint": {"supported": True, "protocol_version": TEMPERATURE_SETPOINT_PROTOCOL_VERSION,
+                                      "refresh_seconds": TEMPERATURE_REFRESH_SECONDS, "deadman_seconds": TEMPERATURE_DEADMAN_SECONDS,
+                                      "raw_pid_target": {"minimum": 0, "maximum": 64}, "calibration": "per_vial_immutable"},
             "safe_stop": {"supported": True, "enabled": False, "scope": "all_outputs"}}
 
 
 def validate_device_operation(operation: str, parameters: Mapping[str, Any]) -> None:
     """Reject unsupported actuator semantics before identity/serial I/O."""
-    if operation not in {"get_status", "read_sensor", "safe_stop", "set_output", "pulse_pump", "set_stir", "pulse_heater"}:
+    if operation not in {"get_status", "read_sensor", "safe_stop", "set_output", "pulse_pump", "set_stir", "pulse_heater", "set_temperature"}:
         raise ValueError(f"unsupported device operation {operation}")
     if operation == "pulse_pump" and parameters.get("direction", "forward") != "forward":
         raise ValueError("reverse pumping is unsupported by verified firmware")

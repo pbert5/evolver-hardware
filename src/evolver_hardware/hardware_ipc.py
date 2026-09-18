@@ -26,7 +26,7 @@ PROVISIONING_EXCHANGE_COUNT = 3
 PROVISIONING_INNER_BUDGET_SECONDS = PROVISIONING_EXCHANGE_COUNT * HARDWARE_EXCHANGE_TIMEOUT_SECONDS
 PROVISIONING_IPC_TIMEOUT_SECONDS = PROVISIONING_INNER_BUDGET_SECONDS + 1.0
 READ_OPERATIONS = {"discover", "get_status", "read_sensor", "protocol_test"}
-ACTUATOR_OPERATIONS = {"safe_stop", "set_stir", "set_output", "pulse_pump", "pulse_heater"}
+ACTUATOR_OPERATIONS = {"safe_stop", "set_stir", "set_output", "pulse_pump", "pulse_heater", "set_temperature"}
 
 
 def _send(sock: socket.socket, value: dict[str, Any]) -> None:
@@ -176,6 +176,13 @@ class HardwareIPCServer:
             operator = request.get("operator")
             if not isinstance(target, str) or not isinstance(operator, str) or not operator: raise ValueError("operator and target_identity are required")
             requires_lease = operation != "safe_stop"
+            if operation == "set_temperature":
+                instrument = next((item for item in self.store.list_instruments() if item.get("device_identity") == target), None)
+                if not instrument:
+                    raise EdgeStoreError("setpoint target identity is not registered")
+                return self.service.set_temperature(instrument["id"], request.get("parameters") or {}, command_id=request.get("command_id", str(uuid4())),
+                                                    operator=operator, lease_token=request.get("lease_token"), lease_owner=operator,
+                                                    require_lease=True, controller_generation=int(request.get("controller_generation", 0))).as_json()
             return self.service.command(operation, target, request.get("parameters") or {}, command_id=request.get("command_id", str(uuid4())),
                                         operator=operator, lease_token=request.get("lease_token"), lease_owner=operator,
                                         require_lease=requires_lease, controller_generation=int(request.get("controller_generation", 0))).as_json()
