@@ -76,6 +76,14 @@ def test_local_serial_transport_reads_firmware_newline_terminated_reply(monkeypa
     assert transport.exchange("PING_!") == "MEV|2|id|1|HELLO|type=minievolver"
 
 
+def test_local_serial_transport_preserves_v2_temperature_ack(monkeypatch: pytest.MonkeyPatch) -> None:
+    serial_module(monkeypatch, responses={"TEMP|2|0|65535_!": b"HW|2|OK|TEMP|applied=1\n"})
+    transport = LocalSerialTransport("/dev/ttyACM-pty-fake")
+    transport.open()
+    assert transport.exchange("TEMP|2|0|65535_!") == "HW|2|OK|TEMP|applied=1"
+    assert FakeSerial.instances[0].writes == [b"TEMP|2|0|65535_!"]
+
+
 def test_local_serial_transport_discards_stale_input_at_session_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
     serial_module(monkeypatch, responses={"PING_!": b"FRESH\n"}, initial_input=b"STALE\n")
     transport = LocalSerialTransport("/dev/ttyACM-fake")

@@ -49,7 +49,10 @@ ACTUATOR_BOUNDS = {
 TEMPERATURE_SETPOINT_PROTOCOL_VERSION = 2
 TEMPERATURE_REFRESH_SECONDS = 5.0
 TEMPERATURE_DEADMAN_SECONDS = 15.0
-FIRMWARE_PID_TARGET_BOUNDS = (0, 64)
+# This is the wire-level raw target domain. Firmware applies its PID control
+# ceiling after decoding the raw value; the host must not confuse that
+# firmware-side limit with the transport representation's range.
+FIRMWARE_PID_TARGET_BOUNDS = (1, 65535)
 _READ_ONLY_COMMANDS = ("HW_STATUS_!", "HW_READ_THERMISTOR,0_!", "HW_READ_THERMISTOR,1_!",
                        "HW_READ_PHOTODIODE,0_!", "HW_READ_PHOTODIODE,1_!")
 
@@ -198,9 +201,9 @@ class LocalSerialTransport:
                 # discard only the two known cross-frame forms and retain the
                 # original bounded deadline.
                 text = raw.rstrip(b"\r\n").decode(errors="replace")
-                wants_status = payload.startswith("HW_")
-                stale = ((wants_status and text.startswith("WHO_ARE_YOU|")) or
-                         (not wants_status and text.startswith("HW|")))
+                expects_hardware_reply = payload.startswith(("HW_", "TEMP|"))
+                stale = ((expects_hardware_reply and text.startswith("WHO_ARE_YOU|")) or
+                         (not expects_hardware_reply and text.startswith("HW|")))
                 if not stale or time.monotonic() >= deadline:
                     break
                 self._serial.timeout = max(0.0, deadline - time.monotonic())  # type: ignore[union-attr]
@@ -732,7 +735,7 @@ class HardwareService(ReadOnlyHardwareService):
                                   operator=operator, require_lease=bool(context.pop("require_lease", False)))
         self.store.validate_control_lease(lease_token=command.lease_token, owner=command.lease_owner,
                                           generation=command.controller_generation)
-        frames = tuple(f"HW_TEMP_V2,{item.channel},{item.raw_pid_target}_!" for item in frozen)
+        frames = tuple(f"TEMP|2|{item.channel}|{item.raw_pid_target}_!" for item in frozen)
         def handler() -> dict[str, Any]:
             with self._session():
                 identity = _identity_reply(self.transport.exchange(HANDSHAKE))
@@ -740,7 +743,7 @@ class HardwareService(ReadOnlyHardwareService):
                     raise HardwareUnavailableError("attached device identity does not match command target")
                 replies = [self.transport.exchange(frame) for frame in frames]
             for reply in replies:
-                _reply(reply, "TEMP_V2")
+                _reply(reply, "TEMP")
             self._frozen_temperature_setpoints[instrument_id] = {
                 "setpoints": frozen,
                 "target_identity": command.target_identity,
@@ -772,7 +775,7 @@ class HardwareService(ReadOnlyHardwareService):
                 lease_token=state["lease_token"], owner=state["lease_owner"],
                 generation=state["controller_generation"])
             command_id = str(uuid4())
-            frames = tuple(f"HW_TEMP_V2,{item.channel},{item.raw_pid_target}_!" for item in setpoints)
+            frames = tuple(f"TEMP|2|{item.channel}|{item.raw_pid_target}_!" for item in setpoints)
             def handler() -> dict[str, Any]:
                 try:
                     with self._session():
@@ -781,7 +784,7 @@ class HardwareService(ReadOnlyHardwareService):
                             raise HardwareUnavailableError("temperature refresh identity mismatch")
                         replies = [self.transport.exchange(frame) for frame in frames]
                     for reply in replies:
-                        _reply(reply, "TEMP_V2")
+                        _reply(reply, "TEMP")
                     return HardwareResult(command_id, True, replies[-1],
                                           {"device_id": state["target_identity"], "operator": state["operator"],
                                            "channels": len(frames), "refresh_seconds": TEMPERATURE_REFRESH_SECONDS,
