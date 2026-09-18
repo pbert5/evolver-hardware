@@ -52,7 +52,8 @@ TEMPERATURE_DEADMAN_SECONDS = 15.0
 # This is the wire-level raw target domain. Firmware applies its PID control
 # ceiling after decoding the raw value; the host must not confuse that
 # firmware-side limit with the transport representation's range.
-FIRMWARE_PID_TARGET_BOUNDS = (1, 65535)
+RAW_TEMPERATURE_TARGET_BOUNDS = (1, 65535)
+FIRMWARE_PID_CEILING = 64
 _READ_ONLY_COMMANDS = ("HW_STATUS_!", "HW_READ_THERMISTOR,0_!", "HW_READ_THERMISTOR,1_!",
                        "HW_READ_PHOTODIODE,0_!", "HW_READ_PHOTODIODE,1_!")
 
@@ -715,7 +716,7 @@ class HardwareService(ReadOnlyHardwareService):
             if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) for value in (slope, intercept)) or float(slope) <= 0:
                 raise ValueError("temperature calibration coefficients are invalid")
             raw = round((float(target) - float(intercept)) / float(slope))
-            if not FIRMWARE_PID_TARGET_BOUNDS[0] <= raw <= FIRMWARE_PID_TARGET_BOUNDS[1]:
+            if not RAW_TEMPERATURE_TARGET_BOUNDS[0] <= raw <= RAW_TEMPERATURE_TARGET_BOUNDS[1]:
                 raise ValueError("temperature calibration produces an out-of-range firmware PID target")
             result.append(TemperatureSetpoint(channel, vial_id, float(target), raw, artifact_id, digest))
         return tuple(result)
@@ -923,7 +924,10 @@ def _capabilities() -> Json:
                                "mode": "output_pulse", "temperature_setpoint": {"supported": False, "reason": "firmware commissioning protocol exposes heater output, not a target"}},
             "temperature_setpoint": {"supported": True, "protocol_version": TEMPERATURE_SETPOINT_PROTOCOL_VERSION,
                                       "refresh_seconds": TEMPERATURE_REFRESH_SECONDS, "deadman_seconds": TEMPERATURE_DEADMAN_SECONDS,
-                                      "raw_pid_target": {"minimum": 0, "maximum": 64}, "calibration": "per_vial_immutable"},
+                                      "raw_pid_target": {"minimum": RAW_TEMPERATURE_TARGET_BOUNDS[0],
+                                                         "maximum": RAW_TEMPERATURE_TARGET_BOUNDS[1]},
+                                      "firmware_pid_ceiling": FIRMWARE_PID_CEILING,
+                                      "calibration": "per_vial_immutable"},
             "safe_stop": {"supported": True, "enabled": False, "scope": "all_outputs"}}
 
 

@@ -64,6 +64,15 @@ def test_setpoint_maps_each_vial_to_immutable_v2_raw_target_and_refreshes(tmp_pa
         assert transport.commands.count("TEMP|2|1|32_!") == 2
 
 
+def test_capability_sink_separates_raw_wire_domain_from_firmware_pid_ceiling(tmp_path):
+    with EdgeStore(tmp_path) as store:
+        service = HardwareService(store, SetpointTransport(), allow_physical=True)
+        capability = service.discover()["capabilities"]["temperature_setpoint"]
+
+        assert capability["raw_pid_target"] == {"minimum": 1, "maximum": 65535}
+        assert capability["firmware_pid_ceiling"] == 64
+
+
 def test_refresh_is_fenced_and_durably_correlated(tmp_path):
     with EdgeStore(tmp_path) as store:
         store.bind(webui_controller_id="central", server_url="https://central", credential="secret", generation=1)
