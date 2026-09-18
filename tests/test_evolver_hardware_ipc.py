@@ -34,6 +34,7 @@ class Transport:
         if payload.startswith("HW_READ_PHOTODIODE,"): return "HW|1|OK|PHOTODIODE|value=65520"
         if payload == "HW_SAFE_!": return "HW|1|OK|SAFE|"
         if payload.startswith("HW_PULSE_STIR,"): return "HW|1|OK|PULSE_STIR|channel=0"
+        if payload.startswith("HW_PULSE_PUMP,"): return "HW|1|OK|PULSE_PUMP|channel=0"
         raise AssertionError(payload)
 
 
@@ -102,12 +103,83 @@ def test_ipc_actuation_requires_local_lease_and_generation(tmp_path):
             with pytest.raises(RuntimeError, match="lease"):
                 request(path, {"operation": "set_stir", "target_identity": found["device_identity"], "physical": True,
                                "operator": "ash", "controller_generation": 1, "parameters": {"channel": 0, "duration_ms": 100, "level": 1}})
+            with pytest.raises(RuntimeError, match="lease"):
+                request(path, {"operation": "pulse_pump", "target_identity": found["device_identity"], "physical": True,
+                               "operator": "ash", "controller_generation": 1,
+                               "parameters": {"channel": 0, "duration_ms": 100}})
             lease = request(path, {"operation": "lease_acquire", "operator": "ash", "ttl_seconds": 60})
             result = request(path, {"operation": "set_stir", "target_identity": found["device_identity"], "physical": True,
                                     "operator": "ash", "lease_token": lease["token"], "controller_generation": 1,
                                     "parameters": {"channel": 0, "duration_ms": 100, "level": 1}})
             assert result["verification"] == "protocol_verified"
             assert transport.commands.count("HW_PULSE_STIR,0,100,1_!") == 1
+        finally:
+            server.close()
+
+
+def test_ipc_safe_stop_reaches_typed_protocol_without_lease_or_foreign_lease(tmp_path):
+    with EdgeStore(tmp_path) as store:
+        store.bind(webui_controller_id="central", server_url="https://central", credential="secret", generation=1)
+        transport = Transport(); service = HardwareService(store, transport, allow_physical=True)
+        path = tmp_path / "hardware.sock"; server = HardwareIPCServer(store, service, path); server.start()
+        try:
+            found = request(path, {"operation": "discover"})
+            result = request(path, {"operation": "safe_stop", "target_identity": found["device_identity"],
+                                    "physical": True, "operator": "ash", "controller_generation": 1})
+            assert result["verification"] == "protocol_verified"
+            assert result["protocol_response"] == "HW|1|OK|SAFE|"
+            assert transport.commands.count("HW_SAFE_!") == 1
+
+            lease = request(path, {"operation": "lease_acquire", "operator": "other-operator", "ttl_seconds": 60})
+            result = request(path, {"operation": "safe_stop", "target_identity": found["device_identity"],
+                                    "physical": True, "operator": "ash", "controller_generation": 1})
+            assert result["verification"] == "protocol_verified"
+            assert transport.commands.count("HW_SAFE_!") == 2
+            assert lease["owner"] == "other-operator"
+        finally:
+            server.close()
+
+
+@pytest.mark.parametrize(
+    "payload, error",
+    [
+        ({"physical": False, "operator": "ash", "controller_generation": 1}, "physical"),
+        ({"physical": True, "controller_generation": 1}, "operator"),
+        ({"physical": True, "operator": "ash", "controller_generation": 0}, "generation"),
+    ],
+)
+def test_ipc_safe_stop_preserves_physical_operator_and_generation_guards(tmp_path, payload, error):
+    with EdgeStore(tmp_path) as store:
+        store.bind(webui_controller_id="central", server_url="https://central", credential="secret", generation=1)
+        transport = Transport(); server = HardwareIPCServer(
+            store, HardwareService(store, transport, allow_physical=True), tmp_path / "hardware.sock")
+        server.start()
+        try:
+            found = request(tmp_path / "hardware.sock", {"operation": "discover"})
+            request_payload = {"operation": "safe_stop", "target_identity": found["device_identity"], **payload}
+            with pytest.raises(RuntimeError, match=error):
+                request(tmp_path / "hardware.sock", request_payload)
+            assert "HW_SAFE_!" not in transport.commands
+        finally:
+            server.close()
+
+
+def test_ipc_safe_stop_rejects_unregistered_target(tmp_path):
+    with EdgeStore(tmp_path) as store:
+        store.bind(webui_controller_id="central", server_url="https://central", credential="secret", generation=1)
+        transport = Transport(); server = HardwareIPCServer(
+            store, HardwareService(store, transport, allow_physical=True), tmp_path / "hardware.sock")
+        server.start()
+        try:
+            result = request(tmp_path / "hardware.sock", {
+                "operation": "safe_stop", "target_identity": "MEV-1", "physical": True,
+                "operator": "ash", "controller_generation": 1,
+            })
+            assert result["request_accepted"] is False
+            assert result["verification"] == "protocol_failed"
+            assert "registered" in result["observed_evidence"]["fault"]
+            assert result["observed_evidence"]["operator"] == "ash"
+            assert "HW_SAFE_!" not in transport.commands
         finally:
             server.close()
 
