@@ -77,11 +77,12 @@ def test_local_serial_transport_reads_firmware_newline_terminated_reply(monkeypa
 
 
 def test_local_serial_transport_preserves_v2_temperature_ack(monkeypatch: pytest.MonkeyPatch) -> None:
-    serial_module(monkeypatch, responses={"TEMP|2|0|65535_!": b"HW|2|OK|TEMP|applied=1\n"})
+    frame = "TEMP|2|SET|17|0|65535|ash|123456|1_!"
+    serial_module(monkeypatch, responses={frame: b"TEMP|2|ACK|17|SET|channel=0,raw=65535,ceiling=64\n"})
     transport = LocalSerialTransport("/dev/ttyACM-pty-fake")
     transport.open()
-    assert transport.exchange("TEMP|2|0|65535_!") == "HW|2|OK|TEMP|applied=1"
-    assert FakeSerial.instances[0].writes == [b"TEMP|2|0|65535_!"]
+    assert transport.exchange(frame) == "TEMP|2|ACK|17|SET|channel=0,raw=65535,ceiling=64"
+    assert FakeSerial.instances[0].writes == [frame.encode()]
 
 
 def test_local_serial_transport_discards_stale_input_at_session_boundary(monkeypatch: pytest.MonkeyPatch) -> None:

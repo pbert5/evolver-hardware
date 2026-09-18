@@ -3,7 +3,8 @@ from __future__ import annotations
 import pytest
 
 from evolver_hardware import EdgeStore
-from evolver_hardware.hardware import HardwareService, HardwareUnavailableError, ProbeError
+from evolver_hardware.hardware import (HardwareService, HardwareUnavailableError, ProbeError,
+                                        _temperature_reply)
 from evolver_hardware.store import LeaseValidationError, StaleGenerationError
 
 
@@ -13,7 +14,7 @@ class SetpointTransport:
     def __init__(self) -> None:
         self.opened = False
         self.commands: list[str] = []
-        self.temperature_reply = "HW|2|OK|TEMP|applied=1"
+        self.temperature_reply: str | None = None
 
     def open(self) -> None:
         self.opened = True
@@ -31,7 +32,12 @@ class SetpointTransport:
         if payload == "HW_SAFE_!":
             return "HW|2|OK|SAFE|stopped=1"
         if payload.startswith("TEMP|2|"):
-            return self.temperature_reply
+            if self.temperature_reply is not None:
+                return self.temperature_reply
+            fields = payload.removesuffix("_!").split("|")
+            assert fields[:3] == ["TEMP", "2", "SET"]
+            assert len(fields) == 9
+            return f"TEMP|2|ACK|{fields[3]}|SET|channel={fields[4]},raw={fields[5]},ceiling=64"
         raise AssertionError(payload)
 
 
@@ -57,11 +63,17 @@ def test_setpoint_maps_each_vial_to_immutable_v2_raw_target_and_refreshes(tmp_pa
             lease_token=lease["token"], controller_generation=1, require_lease=True)
 
         assert result.request_accepted is True
-        assert "TEMP|2|0|32_!" in transport.commands
-        assert "TEMP|2|1|32_!" in transport.commands
+        setpoint_frames = [command for command in transport.commands if command.startswith("TEMP|2|")]
+        assert all(len(frame.removesuffix("_!").split("|")) == 9 for frame in setpoint_frames)
+        assert [frame.removesuffix("_!").split("|")[4:6] for frame in setpoint_frames] == [["0", "32"], ["1", "32"]]
+        assert [int(frame.removesuffix("_!").split("|")[3]) for frame in setpoint_frames] == [1, 2]
+        assert all(frame.removesuffix("_!").split("|")[6] == "ash" and frame.removesuffix("_!").split("|")[7].isdigit() and frame.removesuffix("_!").split("|")[8] == "1"
+                   for frame in setpoint_frames)
         service.refresh_temperature_setpoints()
-        assert transport.commands.count("TEMP|2|0|32_!") == 2
-        assert transport.commands.count("TEMP|2|1|32_!") == 2
+        all_frames = [command for command in transport.commands if command.startswith("TEMP|2|")]
+        assert [int(frame.removesuffix("_!").split("|")[3]) for frame in all_frames] == [1, 2, 3, 4]
+        assert all(frame.removesuffix("_!").split("|")[6] == "ash" and frame.removesuffix("_!").split("|")[7].isdigit() and frame.removesuffix("_!").split("|")[8] == "1"
+                   for frame in all_frames)
 
 
 def test_capability_sink_separates_raw_wire_domain_from_firmware_pid_ceiling(tmp_path):
@@ -203,7 +215,7 @@ def test_setpoint_accepts_raw_wire_domain_boundaries(tmp_path, raw):
             "calibrations": calibrations}, operator="ash", lease_owner="ash",
             lease_token=lease["token"], controller_generation=1, require_lease=True)
         assert result.request_accepted is True
-        assert f"TEMP|2|0|{raw}_!" in transport.commands
+        assert any(frame.removesuffix("_!").split("|")[4:6] == ["0", str(raw)] for frame in transport.commands if frame.startswith("TEMP|2|"))
 
 
 def test_legacy_temperature_ack_is_rejected_fail_closed(tmp_path):
@@ -218,3 +230,12 @@ def test_legacy_temperature_ack_is_rejected_fail_closed(tmp_path):
             service.set_temperature(instrument["id"], {"temperature_c": 32.0,
                 "calibrations": _calibrations(instrument)}, operator="ash", lease_owner="ash",
                 lease_token=lease["token"], controller_generation=1, require_lease=True)
+
+
+@pytest.mark.parametrize("reply", [
+    "TEMP|2|ERR|7|TEMP_ERR_REPLAY|reason=replay",
+    "TEMP|2|ERR|6|TEMP_ERR_AUTHORITY|reason=stale_generation",
+])
+def test_temperature_firmware_replay_and_stale_replies_are_rejected(reply):
+    with pytest.raises(ProbeError, match="temperature"):
+        _temperature_reply(reply, correlation=7, operation="SET", channel=0, raw=32)

@@ -974,6 +974,18 @@ class EdgeStore:
         row = self._connection.execute("SELECT value FROM cursors WHERE name=?", (name,)).fetchone()
         return row["value"] if row else str(default)
 
+    def next_cursor(self, name: str, *, minimum: int = 1, maximum: int = 0xFFFFFFFF) -> int:
+        """Atomically allocate a bounded monotonic wire-protocol cursor."""
+        with self._transaction() as cursor:
+            row = cursor.execute("SELECT value FROM cursors WHERE name=?", (name,)).fetchone()
+            current = int(row["value"]) if row else minimum - 1
+            value = current + 1
+            if value < minimum or value > maximum:
+                raise EdgeStoreError(f"cursor {name} is exhausted")
+            cursor.execute("INSERT INTO cursors VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+                           (name, str(value)))
+            return value
+
     def set_meta(self, key: str, value: Any) -> None:
         """Persist small controller-local settings, never credentials in output."""
         with self._transaction() as cursor:

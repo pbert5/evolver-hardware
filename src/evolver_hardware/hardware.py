@@ -15,6 +15,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import hashlib
 import fcntl
 import errno
 import glob
@@ -369,6 +370,37 @@ def _reply(reply: str, expected: str) -> dict[str, str]:
         raise ProbeError(ProbeOutcome.MALFORMED, "invalid hardware reply version",
                          evidence={"operation": expected.lower(), "version": parts[1]}, cause=error)
     return dict(item.split("=", 1) for item in parts[4].split(",") if "=" in item) if len(parts) > 4 else {}
+
+
+def _temperature_reply(reply: str, *, correlation: int, operation: str,
+                       channel: int, raw: int) -> dict[str, str]:
+    """Parse the secure TEMP|2 acknowledgement grammar from firmware #80."""
+    parts = reply.strip().split("|")
+    if len(parts) < 5 or parts[:3] != ["TEMP", "2", "ACK"]:
+        raise ProbeError(ProbeOutcome.MALFORMED, "invalid TEMP|2 temperature acknowledgement",
+                         evidence={"operation": "temperature", "reply": reply})
+    if parts[3] != str(correlation) or parts[4] != operation:
+        raise ProbeError(ProbeOutcome.PROTOCOL, "temperature acknowledgement correlation or operation mismatch",
+                         evidence={"operation": "temperature", "reply": reply,
+                                   "expected_correlation": correlation, "expected_operation": operation})
+    fields = dict(item.split("=", 1) for item in parts[5].split(",") if "=" in item) if len(parts) > 5 else {}
+    if operation == "SET" and (fields.get("channel") != str(channel) or fields.get("raw") != str(raw)):
+        raise ProbeError(ProbeOutcome.PROTOCOL, "temperature acknowledgement target mismatch",
+                         evidence={"operation": "temperature", "reply": reply})
+    return fields
+
+
+def _temperature_wire_lease(lease_token: str) -> int:
+    """Map the opaque durable host lease to firmware's uint32 lease field."""
+    value = int(hashlib.sha256(lease_token.encode("utf-8")).hexdigest()[:8], 16)
+    return value or 1
+
+
+def _temperature_frame(*, correlation: int, item: "TemperatureSetpoint",
+                       owner: str, lease: int, generation: int) -> str:
+    if not owner or len(owner) > 31 or any(char in owner for char in "|!\r\n"):
+        raise ValueError("temperature owner is not protocol-safe")
+    return (f"TEMP|2|SET|{correlation}|{item.channel}|{item.raw_pid_target}|{owner}|{lease}|{generation}_!")
 
 
 def _identity_reply(reply: str) -> DeviceIdentity:
@@ -736,21 +768,28 @@ class HardwareService(ReadOnlyHardwareService):
                                   operator=operator, require_lease=bool(context.pop("require_lease", False)))
         self.store.validate_control_lease(lease_token=command.lease_token, owner=command.lease_owner,
                                           generation=command.controller_generation)
-        frames = tuple(f"TEMP|2|{item.channel}|{item.raw_pid_target}_!" for item in frozen)
+        wire_lease = _temperature_wire_lease(command.lease_token or "")
         def handler() -> dict[str, Any]:
+            frames = tuple(_temperature_frame(
+                correlation=self.store.next_cursor("temperature_wire_correlation"), item=item,
+                owner=command.lease_owner or operator, lease=wire_lease,
+                generation=command.controller_generation) for item in frozen)
             with self._session():
                 identity = _identity_reply(self.transport.exchange(HANDSHAKE))
                 if not identity.provisioned or identity.device_id != command.target_identity:
                     raise HardwareUnavailableError("attached device identity does not match command target")
                 replies = [self.transport.exchange(frame) for frame in frames]
-            for reply in replies:
-                _reply(reply, "TEMP")
+            for frame, reply in zip(frames, replies):
+                fields = frame.removesuffix("_!").split("|")
+                _temperature_reply(reply, correlation=int(fields[3]), operation="SET",
+                                   channel=int(fields[4]), raw=int(fields[5]))
             self._frozen_temperature_setpoints[instrument_id] = {
                 "setpoints": frozen,
                 "target_identity": command.target_identity,
                 "operator": operator,
                 "lease_owner": command.lease_owner or operator,
                 "lease_token": command.lease_token,
+                "wire_lease": wire_lease,
                 "controller_generation": command.controller_generation,
             }
             return HardwareResult(command.command_id, True, replies[-1],
@@ -776,7 +815,11 @@ class HardwareService(ReadOnlyHardwareService):
                 lease_token=state["lease_token"], owner=state["lease_owner"],
                 generation=state["controller_generation"])
             command_id = str(uuid4())
-            frames = tuple(f"TEMP|2|{item.channel}|{item.raw_pid_target}_!" for item in setpoints)
+            wire_lease = int(state["wire_lease"])
+            frames = tuple(_temperature_frame(
+                correlation=self.store.next_cursor("temperature_wire_correlation"), item=item,
+                owner=state["lease_owner"], lease=wire_lease,
+                generation=state["controller_generation"]) for item in setpoints)
             def handler() -> dict[str, Any]:
                 try:
                     with self._session():
@@ -784,8 +827,10 @@ class HardwareService(ReadOnlyHardwareService):
                         if identity.device_id != state["target_identity"]:
                             raise HardwareUnavailableError("temperature refresh identity mismatch")
                         replies = [self.transport.exchange(frame) for frame in frames]
-                    for reply in replies:
-                        _reply(reply, "TEMP")
+                    for frame, reply in zip(frames, replies):
+                        fields = frame.removesuffix("_!").split("|")
+                        _temperature_reply(reply, correlation=int(fields[3]), operation="SET",
+                                           channel=int(fields[4]), raw=int(fields[5]))
                     return HardwareResult(command_id, True, replies[-1],
                                           {"device_id": state["target_identity"], "operator": state["operator"],
                                            "channels": len(frames), "refresh_seconds": TEMPERATURE_REFRESH_SECONDS,
