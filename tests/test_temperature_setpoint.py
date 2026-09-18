@@ -3,8 +3,9 @@ from __future__ import annotations
 import pytest
 
 from evolver_hardware import EdgeStore
+from evolver_hardware.bundle import calibration_artifact_digest
 from evolver_hardware.hardware import (HardwareService, HardwareUnavailableError, ProbeError,
-                                        _temperature_reply)
+                                        TemperatureSetpoint, _temperature_frame, _temperature_reply)
 from evolver_hardware.store import LeaseValidationError, StaleGenerationError
 
 
@@ -15,6 +16,7 @@ class SetpointTransport:
         self.opened = False
         self.commands: list[str] = []
         self.temperature_reply: str | None = None
+        self.hw_protocol = 2
 
     def open(self) -> None:
         self.opened = True
@@ -22,11 +24,14 @@ class SetpointTransport:
     def close(self) -> None:
         self.opened = False
 
+    def usb_hardware_fingerprint(self) -> dict[str, str]:
+        return {"scheme": "fake-usb-v1", "usb_serial": "FAKE-81"}
+
     def exchange(self, payload: str) -> str:
         assert self.opened
         self.commands.append(payload)
         if payload == "WHO_ARE_YOU_!":
-            return "MEV|2|MEV-81|1|HELLO|type=minievolver,proto=2,fw=0.2,hw_proto=2,id=MEV-81"
+            return f"MEV|2|MEV-81|1|HELLO|type=minievolver,proto=2,fw=0.2,hw_proto={self.hw_protocol},id=MEV-81"
         if payload == "HW_STATUS_!":
             return "HW|2|OK|STATUS|sleeves=2,pumps=6"
         if payload == "HW_SAFE_!":
@@ -41,13 +46,20 @@ class SetpointTransport:
         raise AssertionError(payload)
 
 
-def _calibrations(instrument: dict) -> list[dict[str, object]]:
-    return [
-        {"vial_position_id": position["id"], "artifact_id": f"cal-{index}",
-         "artifact_digest": f"sha256:{index}", "calibration_type": "temperature",
-         "status": "valid", "slope": 1.0, "intercept": 0.0}
-        for index, position in enumerate(instrument["vial_positions"])
-    ]
+def _calibrations(store: EdgeStore, instrument: dict, *, intercept: float = 0.0) -> list[dict[str, object]]:
+    result = []
+    for index, position in enumerate(instrument["vial_positions"]):
+        artifact = {"id": f"cal-{index}", "instrument_id": instrument["id"],
+                    "vial_position_id": position["id"], "calibration_type": "temperature",
+                    "method": "fake", "method_version": "1", "slope": 1.0,
+                    "intercept": intercept, "hardware_fingerprint": instrument["hardware_fingerprint"]}
+        artifact["artifact_digest"] = calibration_artifact_digest(artifact)
+        store.put_calibration_artifact(artifact)
+        result.append({"vial_position_id": position["id"], "artifact_id": artifact["id"],
+                       "artifact_digest": artifact["artifact_digest"], "calibration_type": "temperature",
+                       "status": "valid", "slope": 1.0, "intercept": intercept,
+                       "hardware_fingerprint": instrument["hardware_fingerprint"]})
+    return result
 
 
 def test_setpoint_maps_each_vial_to_immutable_v2_raw_target_and_refreshes(tmp_path):
@@ -59,7 +71,7 @@ def test_setpoint_maps_each_vial_to_immutable_v2_raw_target_and_refreshes(tmp_pa
         lease = store.acquire_local_commissioning_lease("ash", ttl_seconds=60, controller_generation=1)
 
         result = service.set_temperature(instrument["id"], {"temperature_c": 32.0,
-            "calibrations": _calibrations(instrument)}, operator="ash", lease_owner="ash",
+            "calibrations": _calibrations(store, instrument)}, operator="ash", lease_owner="ash",
             lease_token=lease["token"], controller_generation=1, require_lease=True)
 
         assert result.request_accepted is True
@@ -93,7 +105,7 @@ def test_refresh_is_fenced_and_durably_correlated(tmp_path):
         instrument = service.discover()
         lease = store.acquire_local_commissioning_lease("ash", ttl_seconds=60, controller_generation=1)
         service.set_temperature(instrument["id"], {"temperature_c": 32.0,
-            "calibrations": _calibrations(instrument)}, operator="ash", lease_owner="ash",
+            "calibrations": _calibrations(store, instrument)}, operator="ash", lease_owner="ash",
             lease_token=lease["token"], controller_generation=1, require_lease=True)
         service.refresh_temperature_setpoints()
         refresh_id = service.last_temperature_refresh_command_ids[0]
@@ -119,7 +131,7 @@ def test_refresh_rejects_generation_change_before_serial_io(tmp_path):
         instrument = service.discover()
         lease = store.acquire_local_commissioning_lease("ash", ttl_seconds=60, controller_generation=1)
         service.set_temperature(instrument["id"], {"temperature_c": 32.0,
-            "calibrations": _calibrations(instrument)}, operator="ash", lease_owner="ash",
+            "calibrations": _calibrations(store, instrument)}, operator="ash", lease_owner="ash",
             lease_token=lease["token"], controller_generation=1, require_lease=True)
         before = list(transport.commands)
         store.bind(webui_controller_id="central", server_url="https://central", credential="secret", generation=2)
@@ -144,7 +156,7 @@ def test_refresh_failure_handler_records_fault_and_safe_stops(tmp_path):
         instrument = service.discover()
         lease = store.acquire_local_commissioning_lease("ash", ttl_seconds=60, controller_generation=1)
         service.set_temperature(instrument["id"], {"temperature_c": 32.0,
-            "calibrations": _calibrations(instrument)}, operator="ash", lease_owner="ash",
+            "calibrations": _calibrations(store, instrument)}, operator="ash", lease_owner="ash",
             lease_token=lease["token"], controller_generation=1, require_lease=True)
         failing_transport = FailingRefreshTransport()
         service.transport = failing_transport
@@ -167,7 +179,7 @@ def test_refresh_transport_failure_is_journaled_before_boundary_handling(tmp_pat
         instrument = service.discover()
         lease = store.acquire_local_commissioning_lease("ash", ttl_seconds=60, controller_generation=1)
         service.set_temperature(instrument["id"], {"temperature_c": 32.0,
-            "calibrations": _calibrations(instrument)}, operator="ash", lease_owner="ash",
+            "calibrations": _calibrations(store, instrument)}, operator="ash", lease_owner="ash",
             lease_token=lease["token"], controller_generation=1, require_lease=True)
         service.transport = FailingRefreshTransport()
 
@@ -192,9 +204,9 @@ def test_setpoint_rejects_missing_or_out_of_range_calibration_before_serial_io(t
                                     operator="ash", lease_owner="ash", lease_token="unused",
                                     controller_generation=1, require_lease=True)
         assert transport.commands == commands_before
-        calibration = _calibrations(instrument)
+        calibration = _calibrations(store, instrument)
         calibration[0]["intercept"] = 32.1
-        with pytest.raises(ValueError, match="out-of-range"):
+        with pytest.raises(ValueError, match="immutable authority"):
             service.set_temperature(instrument["id"], {"temperature_c": 32.0, "calibrations": calibration},
                                     operator="ash", lease_owner="ash", lease_token="unused",
                                     controller_generation=1, require_lease=True)
@@ -209,8 +221,7 @@ def test_setpoint_accepts_raw_wire_domain_boundaries(tmp_path, raw):
         service = HardwareService(store, transport, allow_physical=True)
         instrument = service.discover()
         lease = store.acquire_local_commissioning_lease("ash", ttl_seconds=60, controller_generation=1)
-        calibrations = _calibrations(instrument)
-        calibrations[0]["intercept"] = 32.0 - raw
+        calibrations = _calibrations(store, instrument, intercept=32.0 - raw)
         result = service.set_temperature(instrument["id"], {"temperature_c": 32.0,
             "calibrations": calibrations}, operator="ash", lease_owner="ash",
             lease_token=lease["token"], controller_generation=1, require_lease=True)
@@ -228,8 +239,57 @@ def test_legacy_temperature_ack_is_rejected_fail_closed(tmp_path):
         lease = store.acquire_local_commissioning_lease("ash", ttl_seconds=60, controller_generation=1)
         with pytest.raises(ProbeError, match="TEMP"):
             service.set_temperature(instrument["id"], {"temperature_c": 32.0,
-                "calibrations": _calibrations(instrument)}, operator="ash", lease_owner="ash",
+            "calibrations": _calibrations(store, instrument)}, operator="ash", lease_owner="ash",
                 lease_token=lease["token"], controller_generation=1, require_lease=True)
+
+
+def test_v1_temperature_device_is_rejected_before_any_temp_frame(tmp_path):
+    with EdgeStore(tmp_path) as store:
+        store.bind(webui_controller_id="central", server_url="https://central", credential="secret", generation=1)
+        transport = SetpointTransport()
+        transport.hw_protocol = 1
+        service = HardwareService(store, transport, allow_physical=True)
+        instrument = service.discover()
+        lease = store.acquire_local_commissioning_lease("ash", ttl_seconds=60, controller_generation=1)
+        with pytest.raises(HardwareUnavailableError, match="protocol v2"):
+            service.set_temperature(instrument["id"], {"temperature_c": 32.0,
+                "calibrations": _calibrations(store, instrument)}, operator="ash", lease_owner="ash",
+                lease_token=lease["token"], controller_generation=1, require_lease=True)
+        assert not any(command.startswith("TEMP|") for command in transport.commands)
+
+
+@pytest.mark.parametrize("correlation", [0, -1, 0x100000000])
+def test_temperature_correlation_rejects_values_outside_uint32_domain(correlation):
+    with pytest.raises(ProbeError, match="correlation"):
+        _temperature_reply("TEMP|2|ACK|1|SET|channel=0,raw=32", correlation=correlation,
+                           operation="SET", channel=0, raw=32)
+
+
+def test_temperature_frame_rejects_unsupported_channel():
+    item = TemperatureSetpoint(2, "vial-2", 32.0, 32, "cal", "digest")
+    with pytest.raises(ValueError, match="channel"):
+        _temperature_frame(correlation=1, item=item, owner="ash", lease=1, generation=1)
+
+
+def test_temperature_rejects_missing_or_mismatched_calibration_binding_before_serial_io(tmp_path):
+    with EdgeStore(tmp_path) as store:
+        store.bind(webui_controller_id="central", server_url="https://central", credential="secret", generation=1)
+        transport = SetpointTransport()
+        service = HardwareService(store, transport, allow_physical=True)
+        instrument = service.discover()
+        calibrations = _calibrations(store, instrument)
+        before = list(transport.commands)
+        missing = [dict(item, hardware_fingerprint=None) for item in calibrations]
+        with pytest.raises(ValueError, match="fingerprint binding"):
+            service.set_temperature(instrument["id"], {"temperature_c": 32.0, "calibrations": missing},
+                                    operator="ash", lease_owner="ash", lease_token="unused",
+                                    controller_generation=1, require_lease=True)
+        mismatched = [dict(item, hardware_fingerprint={"scheme": "other"}) for item in calibrations]
+        with pytest.raises(ValueError, match="fingerprint binding"):
+            service.set_temperature(instrument["id"], {"temperature_c": 32.0, "calibrations": mismatched},
+                                    operator="ash", lease_owner="ash", lease_token="unused",
+                                    controller_generation=1, require_lease=True)
+        assert transport.commands == before
 
 
 @pytest.mark.parametrize("reply", [
