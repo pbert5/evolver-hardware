@@ -41,7 +41,10 @@ class SetpointTransport:
             if self.temperature_reply is not None:
                 return self.temperature_reply
             fields = payload.removesuffix("_!").split("|")
-            assert fields[:3] == ["TEMP", "2", "SET"]
+            assert fields[:3] in (["TEMP", "2", "SET"], ["TEMP", "2", "DISABLE"])
+            if fields[2] == "DISABLE":
+                assert len(fields) == 8
+                return f"TEMP|2|ACK|{fields[3]}|DISABLE|channel={fields[4]}"
             assert len(fields) == 9
             return f"TEMP|2|ACK|{fields[3]}|SET|channel={fields[4]},raw={fields[5]},ceiling=64"
         raise AssertionError(payload)
@@ -256,6 +259,104 @@ def test_refresh_failure_handler_records_fault_and_safe_stops(tmp_path):
         assert observation["component_state"] == "fault"
         assert observation["fault"]["kind"] == "temperature_refresh"
         assert store.inspect_command(result[0].command_id)["status"] == "completed"
+
+
+def test_raw_commissioning_hold_is_uncalibrated_volatile_and_refreshes(tmp_path):
+    with EdgeStore(tmp_path) as store:
+        store.bind(webui_controller_id="central", server_url="https://central", credential="secret", generation=1)
+        transport = SetpointTransport()
+        service = HardwareService(store, transport, allow_physical=True)
+        instrument = service.discover()
+        lease = store.acquire_local_commissioning_lease("ash", ttl_seconds=60, controller_generation=1)
+        result = service.temperature_calibration_hold_raw(
+            instrument["id"], {"vial_position_id": instrument["vial_positions"][0]["id"],
+                               "channel": 0, "raw_target_adc": 4321, "hold_session_id": "cal-raw-1"},
+            physical_intent=True, operator="ash", lease_owner="ash", lease_token=lease["token"],
+            controller_generation=1)
+        assert result.request_accepted is True
+        frame = next(command for command in transport.commands if command.startswith("TEMP|2|SET|"))
+        assert frame.removesuffix("_!").split("|")[4:6] == ["0", "4321"]
+        assert "temperature_c" not in frame and "calibration" not in frame
+        status = service.raw_temperature_hold_status(instrument["id"])
+        assert status["holds"][0]["raw_target_adc"] == 4321
+        assert status["holds"][0]["hold_session_id"] == "cal-raw-1"
+        service.refresh_temperature_setpoints()
+        frames = [command for command in transport.commands if command.startswith("TEMP|2|SET|")]
+        assert frames[-1].removesuffix("_!").split("|")[5] == "4321"
+        disabled = service.disable_raw_temperature_hold(
+            instrument["id"], {"channel": 0}, physical_intent=True, operator="ash", lease_owner="ash",
+            lease_token=lease["token"], controller_generation=1)
+        assert disabled.request_accepted is True
+        assert transport.commands[-1].startswith("TEMP|2|DISABLE|")
+        assert service.raw_temperature_hold_status(instrument["id"])["holds"] == []
+
+
+def test_raw_commissioning_hold_rejects_without_v2_or_authority_before_serial(tmp_path):
+    with EdgeStore(tmp_path) as store:
+        store.bind(webui_controller_id="central", server_url="https://central", credential="secret", generation=1)
+        transport = SetpointTransport()
+        service = HardwareService(store, transport, allow_physical=True)
+        instrument = service.discover()
+        with pytest.raises(PermissionError, match="physical intent"):
+            service.temperature_calibration_hold_raw(
+                instrument["id"], {"vial_position_id": instrument["vial_positions"][0]["id"],
+                                   "channel": 0, "raw_target_adc": 1, "hold_session_id": "x"},
+                operator="ash", controller_generation=1)
+        with pytest.raises(ValueError, match="outside"):
+            service.temperature_calibration_hold_raw(
+                instrument["id"], {"vial_position_id": instrument["vial_positions"][0]["id"],
+                                   "channel": 0, "raw_target_adc": 0, "hold_session_id": "x"},
+                physical_intent=True, operator="ash", controller_generation=1,
+                lease_token="missing", lease_owner="ash")
+        assert not any(command.startswith("TEMP|2|") for command in transport.commands)
+        transport.hw_protocol = 1
+        lease = store.acquire_local_commissioning_lease("ash", ttl_seconds=60, controller_generation=1)
+        with pytest.raises(HardwareUnavailableError, match="protocol v2"):
+            service.temperature_calibration_hold_raw(
+                instrument["id"], {"vial_position_id": instrument["vial_positions"][0]["id"],
+                                   "channel": 0, "raw_target_adc": 1, "hold_session_id": "x"},
+                physical_intent=True, operator="ash", lease_token=lease["token"], lease_owner="ash",
+                controller_generation=1)
+
+
+def test_safe_stop_discards_raw_hold_without_persisting_intent(tmp_path):
+    with EdgeStore(tmp_path) as store:
+        store.bind(webui_controller_id="central", server_url="https://central", credential="secret", generation=1)
+        transport = SetpointTransport()
+        service = HardwareService(store, transport, allow_physical=True)
+        instrument = service.discover()
+        lease = store.acquire_local_commissioning_lease("ash", ttl_seconds=60, controller_generation=1)
+        service.temperature_calibration_hold_raw(
+            instrument["id"], {"vial_position_id": instrument["vial_positions"][0]["id"], "channel": 0,
+                               "raw_target_adc": 99, "hold_session_id": "x"}, physical_intent=True,
+            operator="ash", lease_owner="ash", lease_token=lease["token"], controller_generation=1)
+        service.command("safe_stop", instrument["device_identity"], {}, operator="ash", controller_generation=1)
+        assert service.raw_temperature_hold_status(instrument["id"])["holds"] == []
+        assert service.refresh_temperature_setpoints() == []
+
+
+def test_raw_hold_ipc_is_explicit_maintenance_boundary(tmp_path):
+    with EdgeStore(tmp_path) as store:
+        store.bind(webui_controller_id="central", server_url="https://central", credential="secret", generation=1)
+        transport = SetpointTransport()
+        service = HardwareService(store, transport, allow_physical=True)
+        instrument = service.discover()
+        lease = store.acquire_local_commissioning_lease("ash", ttl_seconds=60, controller_generation=1)
+        path = tmp_path / "hardware.sock"
+        server = HardwareIPCServer(store, service, path)
+        server.start()
+        try:
+            result = request(path, {"operation": "temperature_calibration_hold_raw", "physical": True,
+                "target_identity": instrument["device_identity"], "operator": "ash",
+                "lease_token": lease["token"], "controller_generation": 1,
+                "parameters": {"vial_position_id": instrument["vial_positions"][0]["id"],
+                                "channel": 0, "raw_target_adc": 7, "hold_session_id": "ipc"}})
+            assert result["observed_evidence"]["raw_target_adc"] == 7
+            status = request(path, {"operation": "temperature_calibration_hold_raw_status", "physical": True,
+                                    "target_identity": instrument["device_identity"], "operator": "ash"})
+            assert status["holds"][0]["raw_target_adc"] == 7
+        finally:
+            server.close()
 
 
 def test_refresh_transport_failure_is_journaled_before_boundary_handling(tmp_path):

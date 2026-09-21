@@ -27,6 +27,7 @@ PROVISIONING_INNER_BUDGET_SECONDS = PROVISIONING_EXCHANGE_COUNT * HARDWARE_EXCHA
 PROVISIONING_IPC_TIMEOUT_SECONDS = PROVISIONING_INNER_BUDGET_SECONDS + 1.0
 READ_OPERATIONS = {"discover", "get_status", "read_sensor", "protocol_test"}
 ACTUATOR_OPERATIONS = {"safe_stop", "set_stir", "set_output", "pulse_pump", "pulse_heater", "set_temperature"}
+RAW_HOLD_OPERATION = "temperature_calibration_hold_raw"
 
 
 def _send(sock: socket.socket, value: dict[str, Any]) -> None:
@@ -191,6 +192,36 @@ class HardwareIPCServer:
             if len(normalized) != len(positions): raise ValueError("layout channels must be decimal strings")
             return self.store.record_physical_layout(instrument_id=instrument["id"], positions=normalized,
                                                      operator=operator, device_identity=target)
+        if operation in {RAW_HOLD_OPERATION, f"{RAW_HOLD_OPERATION}_start",
+                         f"{RAW_HOLD_OPERATION}_status", f"{RAW_HOLD_OPERATION}_disable"}:
+            if request.get("physical") is not True:
+                raise PermissionError("raw calibration hold requires explicit physical intent")
+            target = request.get("target_identity")
+            operator = request.get("operator")
+            if not isinstance(target, str) or not isinstance(operator, str) or not operator:
+                raise ValueError("raw calibration hold requires operator and target_identity")
+            instrument = next((item for item in self.store.list_instruments()
+                               if item.get("device_identity") == target), None)
+            if not isinstance(instrument, dict):
+                raise EdgeStoreError("raw calibration hold target identity is not registered")
+            parameters = request.get("parameters") or {}
+            if not isinstance(parameters, dict):
+                raise ValueError("raw calibration hold parameters must be an object")
+            action = (operation.removeprefix(f"{RAW_HOLD_OPERATION}_")
+                      if operation != RAW_HOLD_OPERATION else "start")
+            action = parameters.get("action", request.get("action", action or "start"))
+            if action == "status":
+                return self.service.raw_temperature_hold_status(instrument["id"])
+            context = {"command_id": request.get("command_id", str(uuid4())),
+                       "operator": operator, "lease_token": request.get("lease_token"),
+                       "lease_owner": request.get("lease_owner", operator),
+                       "controller_generation": int(request.get("controller_generation", 0)),
+                       "physical_intent": True}
+            if action == "disable":
+                return self.service.disable_raw_temperature_hold(instrument["id"], parameters, **context).as_json()
+            if action == "start":
+                return self.service.temperature_calibration_hold_raw(instrument["id"], parameters, **context).as_json()
+            raise ValueError("raw calibration hold action must be start, status, or disable")
         if operation in ACTUATOR_OPERATIONS:
             if request.get("physical") is not True: raise PermissionError("physical opt-in is required")
             target = request.get("target_identity")
