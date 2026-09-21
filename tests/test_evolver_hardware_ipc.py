@@ -4,6 +4,7 @@ import json
 import socket
 import stat
 import struct
+import threading
 import time
 
 import pytest
@@ -91,6 +92,93 @@ def test_ipc_client_disconnect_does_not_kill_accept_loop(tmp_path):
                         raise
         finally:
             server.close()
+
+
+def test_ipc_thread_uses_distinct_sqlite_connection(tmp_path, monkeypatch):
+    with EdgeStore(tmp_path) as store:
+        main_thread = threading.get_ident()
+        main_connection = id(store._connection)
+        opened: dict[int, int] = {}
+        original = store._open_connection
+
+        def traced_open():
+            connection = original()
+            opened[threading.get_ident()] = id(connection)
+            return connection
+
+        monkeypatch.setattr(store, "_open_connection", traced_open)
+        path = tmp_path / "hardware.sock"
+        server = HardwareIPCServer(store, HardwareService(store, Transport(), allow_physical=True), path)
+        server.start()
+        try:
+            assert request(path, {"operation": "lease_status"}) == {"status": "none"}
+            worker_connections = [value for thread_id, value in opened.items() if thread_id != main_thread]
+            assert worker_connections
+            assert all(value != main_connection for value in worker_connections)
+        finally:
+            server.close()
+
+
+def test_concurrent_transactions_use_sqlite_contention_not_shared_connection_error(tmp_path):
+    with EdgeStore(tmp_path) as store:
+        path = tmp_path / "hardware.sock"
+        server = HardwareIPCServer(store, HardwareService(store, Transport(), allow_physical=True), path)
+        server.start()
+        entered = threading.Event()
+        release = threading.Event()
+        errors: list[BaseException] = []
+
+        def hold_transaction():
+            try:
+                with store._transaction():
+                    entered.set()
+                    assert release.wait(timeout=2)
+            except BaseException as error:
+                errors.append(error)
+
+        holder = threading.Thread(target=hold_transaction)
+        holder.start()
+        assert entered.wait(timeout=2)
+
+        result: dict[str, object] = {}
+        def acquire():
+            try:
+                result.update(request(path, {"operation": "lease_acquire", "operator": "ash",
+                                             "ttl_seconds": 60, "controller_generation": 1}))
+            except BaseException as error:
+                errors.append(error)
+
+        requester = threading.Thread(target=acquire)
+        requester.start()
+        time.sleep(0.05)
+        release.set()
+        holder.join(timeout=2)
+        requester.join(timeout=2)
+        try:
+            assert not errors
+            assert result["status"] == "active"
+            assert result["generation"] == 1
+        finally:
+            server.close()
+
+
+def test_ipc_close_uses_maximum_request_budget_and_fails_if_worker_stays_alive(tmp_path):
+    with EdgeStore(tmp_path) as store:
+        server = HardwareIPCServer(store, HardwareService(store, Transport(), allow_physical=True),
+                                   tmp_path / "hardware.sock")
+
+        class StuckThread:
+            joined_with = None
+            def join(self, timeout=None):
+                self.joined_with = timeout
+            def is_alive(self):
+                return True
+
+        worker = StuckThread()
+        server._thread = worker
+        with pytest.raises(RuntimeError, match="did not terminate"):
+            server.close()
+        assert worker.joined_with == PROVISIONING_IPC_TIMEOUT_SECONDS + DEFAULT_IPC_TIMEOUT_SECONDS
 
 
 def test_ipc_actuation_requires_local_lease_and_generation(tmp_path):

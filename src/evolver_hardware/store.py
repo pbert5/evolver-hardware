@@ -13,6 +13,7 @@ import json
 import os
 import secrets
 import sqlite3
+import threading
 import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -100,26 +101,49 @@ class EdgeStore:
         self.db_path = self.root / "edge.sqlite3"
         self.event_journal_path = self.root / "run-events.jsonl"
         self.telemetry_spool_path = self.root / "telemetry.jsonl"
-        # The hardware IPC listener is a single serialized daemon boundary,
-        # but its socket loop runs outside the creator thread.  SQLite still
-        # provides the transaction boundary; cross-thread use is restricted
-        # to this process-owned connection.
-        self._connection = sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_SECONDS,
-                                           isolation_level=None, check_same_thread=False)
-        self._connection.row_factory = sqlite3.Row
-        # CLI enrollment and the sync service can briefly overlap on the same
-        # state database.  Wait for that bounded interval before reporting a
-        # lock to the caller; the sync loop separately retries an exhausted
-        # lock as a transient.
-        self._connection.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MILLISECONDS}")
-        self._connection.execute("PRAGMA journal_mode=WAL")
-        self._connection.execute("PRAGMA synchronous=FULL")
-        self._connection.execute("PRAGMA foreign_keys=ON")
+        # A CPython sqlite Connection is owned by exactly one daemon thread.
+        # The poll loop and IPC worker share the on-disk database, not a
+        # pysqlite connection object. SQLite WAL + busy_timeout provide the
+        # cross-connection transaction boundary.
+        self._thread_state = threading.local()
+        self._closed = False
         self._migrate()
         self._reconcile_append_only_files()
 
+    def _open_connection(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.db_path, timeout=SQLITE_BUSY_TIMEOUT_SECONDS,
+                                     isolation_level=None)
+        connection.row_factory = sqlite3.Row
+        # CLI enrollment and the sync service can briefly overlap on the same
+        # state database. Wait for that bounded interval before reporting a
+        # lock to the caller; the sync loop separately retries an exhausted
+        # lock as a transient.
+        connection.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MILLISECONDS}")
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.execute("PRAGMA foreign_keys=ON")
+        return connection
+
+    @property
+    def _connection(self) -> sqlite3.Connection:
+        if self._closed:
+            raise RuntimeError("edge store is closed")
+        connection = getattr(self._thread_state, "connection", None)
+        if connection is None:
+            connection = self._open_connection()
+            self._thread_state.connection = connection
+        return connection
+
+    def close_thread_connection(self) -> None:
+        """Close only the sqlite connection owned by the calling thread."""
+        connection = getattr(self._thread_state, "connection", None)
+        if connection is not None:
+            connection.close()
+            del self._thread_state.connection
+
     def close(self) -> None:
-        self._connection.close()
+        self.close_thread_connection()
+        self._closed = True
 
     def __enter__(self) -> "EdgeStore":
         return self
