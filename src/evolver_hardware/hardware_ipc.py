@@ -98,6 +98,11 @@ class HardwareIPCServer:
         # access) direct access to actuator-capable hardware IPC.
         os.chmod(self.path, 0o600)
         self._server.listen(8)
+        # A timeout gives the accept loop a bounded wake-up path when close()
+        # runs on another thread.  Closing a listening socket from a sibling
+        # thread does not reliably interrupt accept() on every supported
+        # runtime.
+        self._server.settimeout(0.2)
         self._thread = threading.Thread(target=self._serve, name="evolver-hardware-ipc", daemon=True)
         self._thread.start()
 
@@ -121,6 +126,8 @@ class HardwareIPCServer:
             while not self._stop.is_set():
                 try:
                     conn, _ = self._server.accept()
+                except socket.timeout:
+                    continue
                 except OSError:
                     break
                 with conn:
