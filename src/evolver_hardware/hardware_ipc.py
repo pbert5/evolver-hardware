@@ -72,6 +72,7 @@ class HardwareIPCServer:
     def __init__(self, store: EdgeStore, service: HardwareService, path: str | Path = DEFAULT_SOCKET) -> None:
         self.store, self.service, self.path = store, service, Path(path)
         self._server: socket.socket | None = None
+        self._thread: threading.Thread | None = None
         self._stop = threading.Event()
 
     def start(self) -> None:
@@ -97,12 +98,15 @@ class HardwareIPCServer:
         # access) direct access to actuator-capable hardware IPC.
         os.chmod(self.path, 0o600)
         self._server.listen(8)
-        threading.Thread(target=self._serve, name="evolver-hardware-ipc", daemon=True).start()
+        self._thread = threading.Thread(target=self._serve, name="evolver-hardware-ipc", daemon=True)
+        self._thread.start()
 
     def close(self) -> None:
         self._stop.set()
         if self._server:
             self._server.close()
+        if self._thread and self._thread is not threading.current_thread():
+            self._thread.join(timeout=DEFAULT_IPC_TIMEOUT_SECONDS)
         try:
             self.path.unlink()
         except FileNotFoundError:
@@ -110,23 +114,26 @@ class HardwareIPCServer:
 
     def _serve(self) -> None:
         assert self._server is not None
-        while not self._stop.is_set():
-            try:
-                conn, _ = self._server.accept()
-            except OSError:
-                break
-            with conn:
+        try:
+            while not self._stop.is_set():
                 try:
-                    response = {"ok": True, "result": self.dispatch(_recv(conn))}
-                except Exception as error:
-                    response = {"ok": False, "error": str(error), "kind": error.__class__.__name__}
-                try:
-                    _send(conn, response)
+                    conn, _ = self._server.accept()
                 except OSError:
-                    # The client may time out and close while hardware work is
-                    # still in progress.  A failed response belongs to that
-                    # connection and must not kill the accept loop.
-                    pass
+                    break
+                with conn:
+                    try:
+                        response = {"ok": True, "result": self.dispatch(_recv(conn))}
+                    except Exception as error:
+                        response = {"ok": False, "error": str(error), "kind": error.__class__.__name__}
+                    try:
+                        _send(conn, response)
+                    except OSError:
+                        # The client may time out and close while hardware work is
+                        # still in progress. A failed response belongs to that
+                        # connection and must not kill the accept loop.
+                        pass
+        finally:
+            self.store.close_thread_connection()
 
     def dispatch(self, request: dict[str, Any]) -> dict[str, Any]:
         operation = request.get("operation")
