@@ -1048,6 +1048,8 @@ class EdgeStore:
             if isinstance(controller_generation, bool) or controller_generation < 0:
                 raise LeaseValidationError("controller generation must be a non-negative integer")
             generation = controller_generation
+        if generation <= 0:
+            raise LeaseValidationError("physical lease generation must be positive")
         token = secrets.token_urlsafe(32)
         expires = (datetime.now(UTC).timestamp() + ttl_seconds)
         expires_at = datetime.fromtimestamp(expires, UTC).isoformat()
