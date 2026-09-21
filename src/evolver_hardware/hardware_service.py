@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 from pathlib import Path
+import sqlite3
 import time
 from typing import Callable
 
@@ -11,6 +13,20 @@ from .hardware import (HardwareService, HardwareUnavailableError, LocalSerialTra
                         ProbeOutcome, discover_ports)
 from .hardware_ipc import HardwareIPCServer
 from .store import EdgeStore
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _poll_once_with_db_diagnostics(store: EdgeStore, *, requested_port: str | None,
+                                   service: HardwareService) -> None:
+    """Run one poll and surface unexpected sqlite failures before restart."""
+    try:
+        poll_once(store, requested_port=requested_port, service=service)
+    except sqlite3.Error:
+        LOGGER.exception("evolver-hardware poll database failure; terminating for controlled restart",
+                         extra={"component": "hardware_poll", "failure_kind": "sqlite"})
+        raise
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -38,7 +54,7 @@ def main(argv: list[str] | None = None) -> int:
         ipc.start()
         last_refresh = time.monotonic()
         while True:
-            poll_once(store, requested_port=args.port, service=service)
+            _poll_once_with_db_diagnostics(store, requested_port=args.port, service=service)
             if time.monotonic() - last_refresh >= args.refresh_interval:
                 try:
                     service.refresh_temperature_setpoints()
