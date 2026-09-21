@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import sqlite3
 import sys
 from types import SimpleNamespace
 
@@ -11,6 +13,7 @@ from evolver_hardware.hardware import (HardwareUnavailableError,
                                                                     ReadOnlyHardwareService)
 from evolver_hardware.hardware import (IdentityState, normalize_identity, parse_identity,
                                                                     ProbeError, ProbeOutcome, normalize_effective_device_state)
+from evolver_hardware import hardware_service
 from evolver_hardware.hardware_service import build_parser, poll_once
 
 
@@ -226,6 +229,19 @@ def test_repeated_discovery_is_idempotent_and_sends_only_read_commands(tmp_path)
         assert transport.commands == ["WHO_ARE_YOU_!", "HW_STATUS_!"] * 2
         assert all(not command.startswith(("HW_PULSE_", "HW_SET_", "HW_SAFE_"))
                    for command in transport.commands)
+
+
+def test_poll_database_failure_is_logged_and_reraised(tmp_path, monkeypatch, caplog) -> None:
+    with EdgeStore(tmp_path) as store:
+        service = HardwareService(store, FakeTransport(), allow_physical=True)
+        def fail_poll(*_args, **_kwargs):
+            raise sqlite3.OperationalError("database failure")
+        monkeypatch.setattr(hardware_service, "poll_once", fail_poll)
+        with caplog.at_level(logging.ERROR):
+            with pytest.raises(sqlite3.OperationalError, match="database failure"):
+                hardware_service._poll_once_with_db_diagnostics(store, requested_port=None, service=service)
+        assert "hardware poll database failure" in caplog.text
+        assert "controlled restart" in caplog.text
 
 
 def test_blank_identity_is_visible_during_poll_without_registration(tmp_path) -> None:
