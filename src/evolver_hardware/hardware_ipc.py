@@ -205,7 +205,10 @@ class HardwareIPCServer:
             if not isinstance(instrument, dict):
                 raise EdgeStoreError("raw calibration hold target identity is not registered")
             parameters = request.get("parameters") or {}
-            action = operation.removeprefix(f"{RAW_HOLD_OPERATION}_")
+            if not isinstance(parameters, dict):
+                raise ValueError("raw calibration hold parameters must be an object")
+            action = (operation.removeprefix(f"{RAW_HOLD_OPERATION}_")
+                      if operation != RAW_HOLD_OPERATION else "start")
             action = parameters.get("action", request.get("action", action or "start"))
             if action == "status":
                 return self.service.raw_temperature_hold_status(instrument["id"])

@@ -418,7 +418,8 @@ def _temperature_frame(*, correlation: int, item: "TemperatureSetpoint | RawTemp
         raise ValueError("temperature correlation is outside the uint32 wire domain")
     if not TEMPERATURE_CHANNEL_BOUNDS[0] <= item.channel <= TEMPERATURE_CHANNEL_BOUNDS[1]:
         raise ValueError("temperature channel is unsupported")
-    if not owner or len(owner) > 31 or any(char in owner for char in "|!\r\n"):
+    if (not owner or len(owner) > 31 or any(char in owner for char in "|,!\r\n") or
+            lease <= 0 or generation <= 0):
         raise ValueError("temperature owner is not protocol-safe")
     return (f"TEMP|2|SET|{correlation}|{item.channel}|{item.raw_pid_target}|{owner}|{lease}|{generation}_!")
 
@@ -429,14 +430,10 @@ def _temperature_disable_frame(*, correlation: int, channel: int,
         raise ValueError("temperature correlation is outside the uint32 wire domain")
     if not TEMPERATURE_CHANNEL_BOUNDS[0] <= channel <= TEMPERATURE_CHANNEL_BOUNDS[1]:
         raise ValueError("temperature channel is unsupported")
+    if (not owner or len(owner) > 31 or any(char in owner for char in "|,!\r\n") or
+            lease <= 0 or generation <= 0):
+        raise ValueError("temperature owner is not protocol-safe")
     return f"TEMP|2|DISABLE|{correlation}|{channel}|{owner}|{lease}|{generation}_!"
-
-
-def _temperature_safe_frame(*, correlation: int, owner: str,
-                            lease: int, generation: int) -> str:
-    if not TEMPERATURE_CORRELATION_BOUNDS[0] <= correlation <= TEMPERATURE_CORRELATION_BOUNDS[1]:
-        raise ValueError("temperature correlation is outside the uint32 wire domain")
-    return f"TEMP|2|SAFE|{correlation}|{owner}|{lease}|{generation}_!"
 
 
 def _identity_reply(reply: str) -> DeviceIdentity:
@@ -1070,31 +1067,32 @@ class HardwareService(ReadOnlyHardwareService):
             target = state["target"]
             frame = _temperature_frame(correlation=correlation, item=target, owner=state["lease_owner"],
                                        lease=int(state["wire_lease"]), generation=state["controller_generation"])
-            with self._session():
-                identity = _identity_reply(self.transport.exchange(HANDSHAKE))
-                if (identity.device_id != state["target_identity"] or
-                        identity.hw_protocol < TEMPERATURE_SETPOINT_PROTOCOL_VERSION):
-                    raise HardwareUnavailableError("raw temperature refresh identity mismatch")
-                fingerprint_reader = getattr(self.transport, "usb_hardware_fingerprint", None)
-                fingerprint = fingerprint_reader() if callable(fingerprint_reader) else None
-                if fingerprint != state["hardware_fingerprint"]:
-                    raise HardwareUnavailableError("raw temperature refresh hardware fingerprint mismatch")
-                reply = self.transport.exchange(frame)
-            _temperature_reply(reply, correlation=correlation, operation="SET",
-                               channel=target.channel, raw=target.raw_pid_target)
+            def handler() -> dict[str, Any]:
+                with self._session():
+                    identity = _identity_reply(self.transport.exchange(HANDSHAKE))
+                    if (identity.device_id != state["target_identity"] or
+                            identity.hw_protocol < TEMPERATURE_SETPOINT_PROTOCOL_VERSION):
+                        raise HardwareUnavailableError("raw temperature refresh identity mismatch")
+                    fingerprint_reader = getattr(self.transport, "usb_hardware_fingerprint", None)
+                    fingerprint = fingerprint_reader() if callable(fingerprint_reader) else None
+                    if fingerprint != state["hardware_fingerprint"]:
+                        raise HardwareUnavailableError("raw temperature refresh hardware fingerprint mismatch")
+                    reply = self.transport.exchange(frame)
+                _temperature_reply(reply, correlation=correlation, operation="SET",
+                                   channel=target.channel, raw=target.raw_pid_target)
+                return {"command_id": command_id, "request_accepted": True,
+                        "protocol_response": reply,
+                        "observed_evidence": {"raw_target_adc": target.raw_pid_target,
+                                               "refresh_seconds": TEMPERATURE_REFRESH_SECONDS,
+                                               "deadman_seconds": TEMPERATURE_DEADMAN_SECONDS,
+                                               "hold_session_id": state["hold_session_id"]},
+                        "verification": "protocol_verified", "retryable": True}
             result = self.store.execute_command({"command_id": command_id,
                                                   "controller_generation": state["controller_generation"],
                                                   "expected_device": state["target_identity"],
                                                   "requested_device": state["target_identity"],
                                                   "requested_owner": state["lease_owner"],
-                                                  "operator": state["operator"]},
-                                                 lambda: {"command_id": command_id, "request_accepted": True,
-                                                          "protocol_response": reply,
-                                                          "observed_evidence": {"raw_target_adc": target.raw_pid_target,
-                                                                                 "refresh_seconds": TEMPERATURE_REFRESH_SECONDS,
-                                                                                 "deadman_seconds": TEMPERATURE_DEADMAN_SECONDS,
-                                                                                 "hold_session_id": state["hold_session_id"]},
-                                                          "verification": "protocol_verified", "retryable": True})
+                                                  "operator": state["operator"]}, handler)
             self.last_temperature_refresh_command_ids.append(command_id)
             refreshed.append(HardwareResult(result["command_id"], result["request_accepted"], result["protocol_response"],
                                             result["observed_evidence"], result["verification"], result["retryable"]))
