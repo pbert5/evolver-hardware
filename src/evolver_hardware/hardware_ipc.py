@@ -105,12 +105,15 @@ class HardwareIPCServer:
         self._stop.set()
         if self._server:
             self._server.close()
-        if self._thread and self._thread is not threading.current_thread():
-            self._thread.join(timeout=DEFAULT_IPC_TIMEOUT_SECONDS)
         try:
             self.path.unlink()
         except FileNotFoundError:
             pass
+        if self._thread and self._thread is not threading.current_thread():
+            shutdown_budget = PROVISIONING_IPC_TIMEOUT_SECONDS + DEFAULT_IPC_TIMEOUT_SECONDS
+            self._thread.join(timeout=shutdown_budget)
+            if self._thread.is_alive():
+                raise RuntimeError("hardware IPC worker did not terminate within bounded shutdown budget")
 
     def _serve(self) -> None:
         assert self._server is not None
