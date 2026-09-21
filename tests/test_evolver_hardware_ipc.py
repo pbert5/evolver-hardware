@@ -162,6 +162,25 @@ def test_concurrent_transactions_use_sqlite_contention_not_shared_connection_err
             server.close()
 
 
+def test_ipc_close_uses_maximum_request_budget_and_fails_if_worker_stays_alive(tmp_path):
+    with EdgeStore(tmp_path) as store:
+        server = HardwareIPCServer(store, HardwareService(store, Transport(), allow_physical=True),
+                                   tmp_path / "hardware.sock")
+
+        class StuckThread:
+            joined_with = None
+            def join(self, timeout=None):
+                self.joined_with = timeout
+            def is_alive(self):
+                return True
+
+        worker = StuckThread()
+        server._thread = worker
+        with pytest.raises(RuntimeError, match="did not terminate"):
+            server.close()
+        assert worker.joined_with == PROVISIONING_IPC_TIMEOUT_SECONDS + DEFAULT_IPC_TIMEOUT_SECONDS
+
+
 def test_ipc_actuation_requires_local_lease_and_generation(tmp_path):
     with EdgeStore(tmp_path) as store:
         store.bind(webui_controller_id="central", server_url="https://central", credential="secret", generation=1)
