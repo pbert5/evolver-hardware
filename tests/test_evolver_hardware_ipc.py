@@ -117,6 +117,49 @@ def test_ipc_actuation_requires_local_lease_and_generation(tmp_path):
             server.close()
 
 
+def test_ipc_installs_forwarded_lease_in_hardware_store_and_fences_stale_authority(tmp_path):
+    with EdgeStore(tmp_path / "hardware") as store:
+        path = tmp_path / "hardware.sock"
+        server = HardwareIPCServer(store, HardwareService(store, Transport(), allow_physical=True), path)
+        server.start()
+        try:
+            request(path, {"operation": "lease_update", "lease_token": "lease-7", "lease_owner": "ash",
+                           "controller_generation": 7, "lease_expires_at": "2030-01-01T01:00:00+00:00"})
+            assert store.meta("control_lease")["generation"] == 7
+            with pytest.raises(RuntimeError, match="stale"):
+                request(path, {"operation": "lease_update", "lease_token": "old", "lease_owner": "ash",
+                               "controller_generation": 6, "lease_expires_at": "2030-01-01T01:00:00+00:00"})
+            with pytest.raises(RuntimeError, match="conflicts"):
+                request(path, {"operation": "lease_update", "lease_token": "other", "lease_owner": "ash",
+                               "controller_generation": 7, "lease_expires_at": "2030-01-01T01:00:00+00:00"})
+        finally:
+            server.close()
+
+
+def test_controller_and_hardware_use_separate_stores_at_real_ipc_boundary(tmp_path):
+    controller_store = EdgeStore(tmp_path / "controller")
+    hardware_store = EdgeStore(tmp_path / "hardware")
+    transport = Transport()
+    path = tmp_path / "hardware.sock"
+    server = HardwareIPCServer(hardware_store, HardwareService(hardware_store, transport, allow_physical=True), path)
+    server.start()
+    try:
+        found = request(path, {"operation": "discover"})
+        result = request(path, {"operation": "set_stir", "target_identity": found["device_identity"],
+                                "physical": True, "operator": "ash", "lease_token": "lease-7",
+                                "lease_owner": "ash", "lease_expires_at": "2030-01-01T01:00:00+00:00",
+                                "controller_generation": 7,
+                                "parameters": {"channel": 0, "duration_ms": 100, "level": 1}})
+        assert result["verification"] == "protocol_verified"
+        assert controller_store.meta("control_lease") is None
+        assert hardware_store.meta("control_lease")["generation"] == 7
+        assert transport.commands.count("HW_PULSE_STIR,0,100,1_!") == 1
+    finally:
+        server.close()
+        controller_store.close()
+        hardware_store.close()
+
+
 def test_ipc_safe_stop_reaches_typed_protocol_without_lease_or_foreign_lease(tmp_path):
     with EdgeStore(tmp_path) as store:
         store.bind(webui_controller_id="central", server_url="https://central", credential="secret", generation=1)

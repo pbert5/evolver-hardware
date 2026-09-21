@@ -158,6 +158,10 @@ class HardwareIPCServer:
             return self.store.local_commissioning_lease_status()
         if operation == "lease_release":
             return self.store.release_local_commissioning_lease(str(request.get("operator", "")))
+        if operation == "lease_update":
+            return self.store.install_physical_lease(
+                lease_token=request.get("lease_token"), owner=request.get("lease_owner"),
+                generation=request.get("controller_generation"), expires_at=request.get("lease_expires_at")) or {"status": "installed"}
         if operation == "layout_record":
             target = request.get("target_identity")
             operator = request.get("operator")
@@ -176,6 +180,10 @@ class HardwareIPCServer:
             operator = request.get("operator")
             if not isinstance(target, str) or not isinstance(operator, str) or not operator: raise ValueError("operator and target_identity are required")
             requires_lease = operation != "safe_stop"
+            if requires_lease and request.get("lease_expires_at") is not None:
+                self.store.install_physical_lease(
+                    lease_token=request.get("lease_token"), owner=request.get("lease_owner", operator),
+                    generation=request.get("controller_generation"), expires_at=request.get("lease_expires_at"))
             if operation == "set_temperature":
                 instrument = next((item for item in self.store.list_instruments() if item.get("device_identity") == target), None)
                 if not instrument:

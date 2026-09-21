@@ -1005,6 +1005,25 @@ class EdgeStore:
                  "owner": owner, "generation": generation, "expires_at": expires_at}
         self.set_meta("control_lease", value)
 
+    def install_physical_lease(self, *, lease_token: str, owner: str, generation: int,
+                               expires_at: str) -> None:
+        """Install lease material at the final physical authority boundary."""
+        if (not isinstance(lease_token, str) or not lease_token or
+                not isinstance(owner, str) or not owner or
+                isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0 or
+                not isinstance(expires_at, str) or not expires_at):
+            raise LeaseValidationError("physical lease identity, positive generation, and expiry are required")
+        current = self.meta("control_lease")
+        if isinstance(current, dict):
+            current_generation = current.get("generation")
+            if isinstance(current_generation, int) and generation < current_generation:
+                raise LeaseValidationError("physical lease generation is stale")
+            if generation == current_generation:
+                digest = hashlib.sha256(lease_token.encode()).hexdigest()
+                if digest != current.get("token_digest") or owner != current.get("owner"):
+                    raise LeaseValidationError("physical lease authority conflicts with the active generation")
+        self.set_control_lease(lease_token=lease_token, owner=owner, generation=generation, expires_at=expires_at)
+
     def acquire_local_commissioning_lease(self, owner: str, ttl_seconds: int = 900,
                                           controller_generation: int | None = None) -> Json:
         """Issue a bounded host-local maintenance lease for the IPC service."""
